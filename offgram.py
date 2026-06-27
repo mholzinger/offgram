@@ -104,10 +104,23 @@ SECTIONS = ["posts", "story", "reels", "highlights", "tagged"]
 # config.py) names a session in ~/.config/instaloader/ (make one via `instaloader
 # --login USER`).
 INSTALOADER_CMD = [sys.executable, "-m", "instaloader"]
-INSTALOADER_EXTRA = []                              # e.g. ["--stories", "--highlights"]
-# Note: no --quiet, so per-post progress streams into the in-app log panel.
-INSTALOADER_BASE = ["--dirname-pattern={target}", "--fast-update",
-                    "--no-video-thumbnails"]
+INSTALOADER_EXTRA = []                              # extra flags, posts pass only
+# Common flags for every instaloader pass (--dirname-pattern + --latest-stamps are
+# added per-pass; no --quiet, so progress streams into the in-app log panel).
+INSTALOADER_COMMON = ["--fast-update", "--no-video-thumbnails"]
+# Ephemeral / secondary content: each runs as its own pass routed into the matching
+# section subfolder so offgram's tabs pick it up. OFFGRAM_EPHEMERAL=0 -> posts only.
+# (Reels come down with posts — Instagram now serves them in the main feed.)
+GRAB_EPHEMERAL = os.environ.get("OFFGRAM_EPHEMERAL", "1") != "0"
+PASS_DELAY = float(os.environ.get("OFFGRAM_PASS_DELAY", "6"))   # gap between passes
+# Each pass: (label, dirname-pattern, flags). Highlights MUST use {profile} not
+# {target}: instaloader sets {target}=<profile>/<highlight-title> for highlights,
+# which would scatter them into per-collection folders offgram can't see. {profile}
+# is always the account, so all highlights land flat in <profile>/highlights/.
+# (tagged is omitted: instaloader gives it a ":tagged" target that collides.)
+EPHEMERAL_PASSES = [("story", "{target}/story", ["--no-posts", "--stories"]),
+                    ("highlights", "{profile}/highlights", ["--no-posts", "--highlights"]),
+                    ("reels", "{target}/reels", ["--no-posts", "--reels"])]
 
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 VIDEO_EXT = {".mp4", ".mov", ".webm", ".mkv"}
@@ -375,6 +388,49 @@ HEALTH = {}                  # name -> {status, checked, userid, new_username, n
 HEARTBEAT_INTERVAL = float(os.environ.get("OFFGRAM_HEARTBEAT_INTERVAL", "4"))
 _il = {"ctx": None, "tried": False}
 
+# Active account — which instaloader session updates and heartbeat use. Defaults
+# to the configured login; switchable at runtime among the saved sessions.
+ACCOUNT_FILE = CACHE_ROOT / "account.txt"
+ACTIVE_LOGIN = None
+
+
+def list_sessions():
+    d = Path.home() / ".config" / "instaloader"
+    out = []
+    if d.is_dir():
+        for f in d.iterdir():
+            if f.name.startswith("session-") and f.is_file():
+                out.append(f.name[len("session-"):])
+    return sorted(out)
+
+
+def current_login():
+    global ACTIVE_LOGIN
+    if ACTIVE_LOGIN is None:
+        try:
+            if ACCOUNT_FILE.exists():
+                ACTIVE_LOGIN = ACCOUNT_FILE.read_text(encoding="utf-8").strip()
+        except Exception:                             # noqa: BLE001
+            pass
+        if not ACTIVE_LOGIN:
+            ACTIVE_LOGIN = INSTALOADER_LOGIN
+    return ACTIVE_LOGIN
+
+
+def set_login(name):
+    global ACTIVE_LOGIN
+    name = (name or "").strip()
+    if name not in list_sessions():
+        return False
+    ACTIVE_LOGIN = name
+    try:
+        CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+        ACCOUNT_FILE.write_text(name, encoding="utf-8")
+    except Exception:                                 # noqa: BLE001
+        pass
+    _il["ctx"], _il["tried"] = None, False            # rebuild context as new account
+    return True
+
 
 def load_health():
     global HEALTH
@@ -402,8 +458,8 @@ def _il_context():
     try:
         import instaloader
         loader = instaloader.Instaloader(quiet=True)
-        if INSTALOADER_LOGIN:
-            loader.load_session_from_file(INSTALOADER_LOGIN)
+        if current_login():
+            loader.load_session_from_file(current_login())
         _il["ctx"] = loader
     except Exception as exc:                          # noqa: BLE001
         print("heartbeat: instaloader/session unavailable (%s)" % exc)
@@ -720,11 +776,13 @@ def run_update(profiles):
             pass
 
 
-def _run_one(profile):
-    cmd = list(INSTALOADER_CMD) + INSTALOADER_BASE + list(INSTALOADER_EXTRA)
-    cmd += ["--latest-stamps", str(STAMPS_FILE)]
-    if INSTALOADER_LOGIN:
-        cmd += ["--login", INSTALOADER_LOGIN]
+def _il_run(profile, dirpat, flags, extra=None):
+    """Run one instaloader pass, streaming its output into the profile's job log."""
+    cmd = list(INSTALOADER_CMD) + INSTALOADER_COMMON
+    cmd += ["--dirname-pattern=" + dirpat, "--latest-stamps", str(STAMPS_FILE)]
+    cmd += list(flags) + list(extra or [])
+    if current_login():
+        cmd += ["--login", current_login()]
     cmd += [profile]
     log = JOBS[profile]["log"]
     log.append("$ " + " ".join(cmd))
@@ -736,13 +794,23 @@ def _run_one(profile):
             line = line.rstrip("\n")
             if line:
                 log.append(line)
-                if len(log) > 400:
-                    del log[:len(log) - 400]
+                if len(log) > 500:
+                    del log[:len(log) - 500]
         proc.wait()
-        rc = proc.returncode
+        return proc.returncode
     except Exception as exc:                          # noqa: BLE001
         log.append("error: %s" % exc)
-        rc = -1
+        return -1
+
+
+def _run_one(profile):
+    log = JOBS[profile]["log"]
+    rc = _il_run(profile, "{target}", [], INSTALOADER_EXTRA)     # posts (+ reels, pic)
+    if GRAB_EPHEMERAL:
+        for sub, dirpat, flags in EPHEMERAL_PASSES:
+            time.sleep(PASS_DELAY)                     # space out passes to avoid throttling
+            log.append("--- fetching %s ---" % sub)
+            _il_run(profile, dirpat, flags)
     with JOBS_LOCK:
         JOBS[profile]["running"] = False
         JOBS[profile]["rc"] = rc
@@ -764,8 +832,19 @@ body{margin:0;background:#0e0e10;color:#e7e7ea;
 a{color:#7db4ff;text-decoration:none}
 header{position:sticky;top:0;z-index:10;background:#16161a;
  border-bottom:1px solid #26262c;padding:12px 18px;display:flex;
- align-items:center;gap:14px}
+ align-items:center;gap:10px;flex-wrap:wrap}
 header h1{font-size:17px;margin:0;font-weight:600}
+#search{background:#0e0e10;border:1px solid #3a3a44;color:#e7e7ea;padding:6px 10px;
+ border-radius:7px;font-size:13px;width:210px}
+#search:focus{outline:none;border-color:#2c5fb3}
+#acct{background:#0e0e10;border:1px solid #3a3a44;color:#e7e7ea;padding:5px 8px;
+ border-radius:7px;font-size:13px}
+.legend{position:sticky;top:53px;z-index:9;display:flex;flex-wrap:wrap;gap:16px;
+ align-items:center;padding:7px 18px;color:#9a9aa3;font-size:12px;
+ background:#121216;border-bottom:1px solid #1c1c22}
+.legend span.dot{margin-right:5px}
+.addbar{margin:0 0 14px;padding:10px 14px;background:#16161a;border:1px solid #2a2a32;
+ border-radius:8px;display:none}
 .sp{flex:1}.sub{color:#9a9aa3;font-size:13px}
 .btn{background:#2a2a32;border:1px solid #3a3a44;color:#e7e7ea;padding:6px 12px;
  border-radius:7px;cursor:pointer;font-size:13px}
@@ -795,9 +874,12 @@ header h1{font-size:17px;margin:0;font-weight:600}
 .banner{background:#23314a;border:1px solid #2c5fb3;border-radius:8px;
  padding:10px 14px;margin:0 0 16px}
 #log{position:fixed;right:0;bottom:0;width:min(540px,100%);max-height:48vh;
- overflow:auto;background:#0a0a0c;border:1px solid #2a2a32;border-radius:10px 0 0 0;
- padding:10px 12px;font:12px/1.45 ui-monospace,Menlo,monospace;white-space:pre-wrap;
+ min-height:96px;overflow:auto;background:#0a0a0c;border:1px solid #2a2a32;
+ border-radius:10px 0 0 0;padding:10px 12px;
+ font:12px/1.45 ui-monospace,Menlo,monospace;white-space:pre-wrap;
  display:none;z-index:60}
+.loghdr{font-family:-apple-system,sans-serif;color:#9a9aa3;margin:-2px 0 6px;
+ border-bottom:1px solid #1c1c22;padding-bottom:4px}
 #log .x{float:right;cursor:pointer;color:#9a9aa3}
 #lb{position:fixed;inset:0;background:rgba(0,0,0,.93);display:none;z-index:50;
  flex-direction:column}
@@ -836,11 +918,13 @@ document.addEventListener('keydown',e=>{
  if(document.getElementById('lb').style.display!=='flex')return;
  if(e.key==='Escape')closeLB();if(e.key==='ArrowLeft')step(-1);if(e.key==='ArrowRight')step(1);});
 function showLog(){document.getElementById('log').style.display='block';}
+function renderLog(j){var lines=[],jobs=(j&&j.jobs)||{};
+ for(var k in jobs){lines.push('### '+k+(jobs[k].running?' (running)':' (done)'));
+  lines.push(jobs[k].log.slice(-20).join('\\n'));}
+ document.getElementById('logbody').textContent=lines.length?lines.join('\\n')
+  :'No activity yet.\\nRun an update (\\u21bb) and progress streams here live.';}
 function poll(reloadWhenDone){fetch('/status').then(r=>r.json()).then(j=>{
- let lines=[];for(const k in j.jobs){let job=j.jobs[k];
-  lines.push('### '+k+(job.running?' (running)':' (done)'));
-  lines.push(job.log.slice(-14).join('\\n'));}
- document.getElementById('logbody').textContent=lines.join('\\n');
+ renderLog(j);
  if(j.any)setTimeout(()=>poll(reloadWhenDone),1500);
  else if(reloadWhenDone)setTimeout(()=>location.reload(),1200);});}
 function upd(p){showLog();fetch('/update',{method:'POST',
@@ -855,6 +939,33 @@ function hbpoll(){fetch('/status').then(r=>r.json()).then(j=>{var h=j.heartbeat;
  var el=document.getElementById('hbstat');
  if(h&&h.running){if(el)el.textContent=' · checking '+h.done+'/'+h.total+' '+(h.current||'');
   setTimeout(hbpoll,1500);}else{location.reload();}});}
+function toggleLog(){var l=document.getElementById('log');
+ if(l.style.display==='block'){l.style.display='none';return;}
+ l.style.display='block';fetch('/status').then(function(r){return r.json();}).then(renderLog);}
+function switchAcct(){var v=document.getElementById('acct').value;
+ fetch('/account',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
+  body:'login='+encodeURIComponent(v)}).then(function(){location.reload();});}
+function igName(s){return (s||'').toLowerCase().replace(/^@/,'').replace(/[^a-z0-9._]/g,'');}
+function doSearch(){var q=igName(document.getElementById('search').value);
+ var cards=document.querySelectorAll('.card'),any=false,exact=false;
+ cards.forEach(function(c){var n=c.getAttribute('data-name')||'';
+  var hit=q===''||n.indexOf(q)>=0;c.style.display=hit?'':'none';
+  if(hit)any=true;if(n===q)exact=true;});
+ var ab=document.getElementById('addbar');ab.textContent='';
+ if(q&&!exact){ab.style.display='block';
+  var sp=document.createElement('span');sp.innerHTML='Not archived yet: <b>@'+q+'</b> &nbsp; ';
+  var b=document.createElement('button');b.className='btn go';b.textContent='+ Archive @'+q;
+  b.onclick=function(){addProfile(q);};
+  ab.appendChild(sp);ab.appendChild(b);
+  if(!any){var s=document.createElement('span');s.className='sub';
+   s.textContent='  (no existing matches)';ab.appendChild(s);}}
+ else{ab.style.display='none';}}
+function addSearched(){var q=igName(document.getElementById('search').value);if(q)addProfile(q);}
+function addProfile(name){name=igName(name);if(!name)return;
+ if(!confirm('Start archiving @'+name+' with instaloader? It will download the profile.'))return;
+ showLog();fetch('/add',{method:'POST',
+  headers:{'Content-Type':'application/x-www-form-urlencoded'},
+  body:'profile='+encodeURIComponent(name)}).then(function(){poll(true);});}
 """
 
 
@@ -866,8 +977,9 @@ def page(title, body, extra_js=""):
             "<span class='nav l' onclick='step(-1)'>‹</span>"
             "<span class='nav r' onclick='step(1)'>›</span>"
             "<div class='stage'></div><div class='cap' id='cap'></div></div>"
-            "<div id='log'><span class='x' onclick=\"document.getElementById('log')"
-            ".style.display='none'\">×</span><div id='logbody'></div></div>"
+            "<div id='log'><div class='loghdr'>activity log"
+            "<span class='x' onclick=\"document.getElementById('log')"
+            ".style.display='none'\">×</span></div><div id='logbody'></div></div>"
             "<script>%s</script><script>%s</script></body></html>"
             % (html.escape(title), CSS, body, JS_COMMON, extra_js)).encode("utf-8")
 
@@ -919,22 +1031,48 @@ def render_index():
         bits = ", ".join("%d %s" % (rec["counts"][k], k)
                          for k in SECTIONS if rec["counts"].get(k))
         cards.append(
-            "<div class='card'><a class='thumb' href='/p/%s'>%s"
+            "<div class='card' data-name='%s'><a class='thumb' href='/p/%s'>%s"
             "<span class='badge'>%d</span></a><div class='meta'>"
             "<b>%s%s</b><div class='s2'>%s</div>"
             "<button class='btn' style='margin-top:8px' onclick=\"upd('%s')\">↻ update</button>"
             "</div></div>"
-            % (pe, img, rec["total"], health_dot(HEALTH.get(name)),
-               html.escape(name), html.escape(bits or "empty"), pe))
+            % (html.escape(name.lower()), pe, img, rec["total"],
+               health_dot(HEALTH.get(name)), html.escape(name),
+               html.escape(bits or "empty"), pe))
     built = time.strftime("%Y-%m-%d %H:%M", time.localtime(INDEX.get("built", 0)))
+    legend = ("<div class='legend'>"
+              "<span><span class='dot' style='background:#3fb950'></span>alive</span>"
+              "<span><span class='dot' style='background:#d29922'></span>private</span>"
+              "<span><span class='dot' style='background:#f85149'></span>dead</span>"
+              "<span><span class='dot' style='background:#539bf5'></span>renamed</span>"
+              "<span><span class='dot' style='background:transparent;"
+              "box-shadow:inset 0 0 0 1.6px #6e7681'></span>not checked</span>"
+              "<span style='margin-left:auto;color:#6e7681'>hover a dot for details</span>"
+              "</div>")
+    sessions = list_sessions()
+    cur = current_login()
+    if sessions:
+        opts = "".join("<option value='%s'%s>@%s</option>"
+                       % (html.escape(s), " selected" if s == cur else "",
+                          html.escape(s)) for s in sessions)
+        acct = ("<select id='acct' title='active instaloader account' "
+                "onchange='switchAcct()'>%s</select>" % opts)
+    else:
+        acct = "<span class='sub'>no login</span>"
     body = ("%s<header><h1>offgram</h1>"
+            "<input id='search' placeholder='search, or type @name to add…' "
+            "oninput='doSearch()' onkeydown='if(event.key===&quot;Enter&quot;)addSearched()'>"
             "<span class='sub'>%d profiles · indexed %s</span>"
             "<span class='sub' id='hbstat'></span><span class='sp'></span>"
+            "<span class='sub'>as</span>%s"
             "<button class='btn' onclick='heartbeat()'>♥ Check all</button>"
             "<button class='btn' onclick='rescan()'>⟳ rescan</button>"
-            "<button class='btn go' onclick='updAll()'>↻ Update all</button></header>"
-            "<div class='wrap'>%s<div class='grid'>%s</div></div>"
-            % (auto, len(profiles), built, scan_banner(), "".join(cards)))
+            "<button class='btn go' onclick='updAll()'>↻ Update all</button>"
+            "<button class='btn' onclick='toggleLog()'>▤ log</button></header>"
+            "%s<div class='wrap'><div class='addbar' id='addbar'></div>"
+            "%s<div class='grid'>%s</div></div>"
+            % (auto, len(profiles), built, acct, legend, scan_banner(),
+               "".join(cards)))
     return page("offgram", body)
 
 
@@ -1066,6 +1204,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 names = [p] if (p and p in INDEX["profiles"]) else None
                 start_heartbeat(names)
             return self._send(200, b'{"ok":true}', "application/json")
+        if u.path == "/add":
+            p = form.get("profile", [""])[0].strip().lstrip("@").lower()
+            if p and re.match(r"^[a-z0-9._]{1,40}$", p):
+                if not (p in JOBS and JOBS[p]["running"]):
+                    # run_update downloads then scans the new profile into the index
+                    threading.Thread(target=run_update, args=([p],), daemon=True).start()
+                return self._send(200, b'{"ok":true}', "application/json")
+            return self._send(400, b'{"ok":false}', "application/json")
+        if u.path == "/account":
+            ok = set_login(form.get("login", [""])[0])
+            return self._send(200 if ok else 400,
+                              b'{"ok":true}' if ok else b'{"ok":false}',
+                              "application/json")
         return self._send(404, b"not found")
 
     def serve_thumb(self, rel):
