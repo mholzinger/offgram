@@ -1,0 +1,9 @@
+# offgram itself is Python standard-library only.
+#
+# The single dependency is instaloader — and it MUST be the patched fork below.
+# Stock instaloader 4.15.1 is broken against current Instagram (retired doc_id /
+# GraphQL changes). This fork carries the unmerged fixes.
+instaloader @ git+https://github.com/mholzinger/instaloader@fix-profile-metadata-web-profile-info
+
+# System (non-pip) dependency, optional: ffmpeg — used to generate poster frames
+# for videos that have no thumbnail. Install via `brew install ffmpeg`.

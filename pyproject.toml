@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "offgram"
+version = "0.1.0"
+description = "Offline archive browser & viewer companion to instaloader"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "mholzinger" }]
+keywords = ["instagram", "instaloader", "archive", "offline", "gallery", "self-hosted"]
+classifiers = [
+    "Environment :: Web Environment",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Graphics :: Viewers",
+]
+
+# offgram itself is standard-library only; the one runtime dependency is the
+# patched instaloader fork (stock 4.15.1 is broken against current Instagram).
+dependencies = [
+    "instaloader @ git+https://github.com/mholzinger/instaloader@fix-profile-metadata-web-profile-info",
+]
+
+[project.urls]
+Homepage = "https://github.com/mholzinger/offgram"
+Issues = "https://github.com/mholzinger/offgram/issues"
+
+[project.scripts]
+offgram = "offgram:main"
+
+[tool.setuptools]
+py-modules = ["offgram"]
