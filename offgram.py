@@ -40,6 +40,7 @@ import tempfile
 import threading
 import time
 import urllib.parse
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
@@ -118,9 +119,9 @@ PASS_DELAY = float(os.environ.get("OFFGRAM_PASS_DELAY", "6"))   # gap between pa
 # which would scatter them into per-collection folders offgram can't see. {profile}
 # is always the account, so all highlights land flat in <profile>/highlights/.
 # (tagged is omitted: instaloader gives it a ":tagged" target that collides.)
-EPHEMERAL_PASSES = [("story", "{target}/story", ["--no-posts", "--stories"]),
-                    ("highlights", "{profile}/highlights", ["--no-posts", "--highlights"]),
-                    ("reels", "{target}/reels", ["--no-posts", "--reels"])]
+EPHEMERAL_PASSES = [("story", ["--no-posts", "--stories"]),
+                    ("highlights", ["--no-posts", "--highlights"]),
+                    ("reels", ["--no-posts", "--reels"])]
 
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 VIDEO_EXT = {".mp4", ".mov", ".webm", ".mkv"}
@@ -283,14 +284,38 @@ def load_index():
     return False
 
 
+SCAN_FILE = CACHE_ROOT / "scan-progress.json"
+
+
+def save_scan_progress(pending):
+    try:
+        CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+        SCAN_FILE.write_text(json.dumps({"pending": list(pending)}), encoding="utf-8")
+    except Exception:                                 # noqa: BLE001
+        pass
+
+
+def load_scan_pending():
+    if SCAN_FILE.exists():
+        try:
+            return json.loads(SCAN_FILE.read_text(encoding="utf-8")).get("pending", [])
+        except Exception:                             # noqa: BLE001
+            pass
+    return []
+
+
 def rescan(profiles=None, full=False):
-    """Background-safe scan. profiles=None means all."""
+    """Background-safe scan. profiles=None means all. A pending set is persisted
+    after every batch, so an interrupted scan auto-resumes on the next startup."""
     if SCAN["running"]:
         return
     SCAN["running"] = True
     try:
+        full_scan = profiles is None
         names = profiles if profiles is not None else list_profile_names()
         SCAN["total"], SCAN["done"] = len(names), 0
+        pending = set(names)
+        save_scan_progress(pending)
         # Scan profiles in parallel: the cost is per-directory I/O latency (worst
         # over a network share), which overlaps cleanly. Workers only read the
         # filesystem; INDEX writes stay on this thread under the lock.
@@ -308,16 +333,18 @@ def rescan(profiles=None, full=False):
                     with INDEX_LOCK:
                         INDEX["profiles"][name] = rec
                 SCAN["done"] += 1
+                pending.discard(name)
                 if SCAN["done"] % 10 == 0:
                     save_index()
-        # drop profiles whose folders disappeared (only on a full scan)
-        if profiles is None:
+                    save_scan_progress(pending)
+        if full_scan:                                 # drop vanished profiles
             live = set(names)
             with INDEX_LOCK:
                 for gone in [p for p in INDEX["profiles"] if p not in live]:
                     del INDEX["profiles"][gone]
         INDEX["built"] = int(time.time())
         save_index()
+        save_scan_progress(set())                     # done — nothing pending
         print("scan complete: %d profiles" % len(INDEX["profiles"]))
         start_prewarm()
     finally:
@@ -383,7 +410,9 @@ def start_prewarm():
 # account, so it is THROTTLED and runs on demand only, never automatically.
 # ---------------------------------------------------------------------------
 HEARTBEAT_FILE = CACHE_ROOT / "heartbeat.json"
-HEARTBEAT = {"running": False, "done": 0, "total": 0, "current": ""}
+HEARTBEAT = {"running": False, "stop": False, "current": "", "done": 0,
+             "total": 0, "queue": []}
+HEARTBEAT_PROGRESS_FILE = CACHE_ROOT / "heartbeat-progress.json"
 HEALTH = {}                  # name -> {status, checked, userid, new_username, note}
 HEARTBEAT_INTERVAL = float(os.environ.get("OFFGRAM_HEARTBEAT_INTERVAL", "4"))
 _il = {"ctx": None, "tried": False}
@@ -449,6 +478,60 @@ def save_health():
         pass
 
 
+# ---------------------------------------------------------------------------
+# Identity registry — the Instagram numeric user-id is the canonical, immutable
+# identity; the folder and username are mutable aliases. Keyed by folder (the
+# on-disk storage location, which never moves). Lets renames resolve to the live
+# handle without touching the folder.
+# ---------------------------------------------------------------------------
+IDENTITY = {}                # folder -> {userid, username (current), aliases:[...]}
+IDENTITY_FILE = CACHE_ROOT / "identity.json"
+
+
+def load_identity():
+    global IDENTITY
+    if IDENTITY_FILE.exists():
+        try:
+            IDENTITY = json.loads(IDENTITY_FILE.read_text(encoding="utf-8"))
+        except Exception:                             # noqa: BLE001
+            IDENTITY = {}
+
+
+def save_identity():
+    try:
+        CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+        IDENTITY_FILE.write_text(json.dumps(IDENTITY), encoding="utf-8")
+    except Exception:                                 # noqa: BLE001
+        pass
+
+
+def update_identity(folder, userid=None, username=None):
+    rec = IDENTITY.get(folder) or {"userid": None, "username": folder,
+                                   "aliases": [folder]}
+    if userid:
+        rec["userid"] = str(userid)
+    if username and username != rec["username"]:
+        for a in (rec["username"], username):
+            if a and a not in rec["aliases"]:
+                rec["aliases"].append(a)
+        rec["username"] = username
+    IDENTITY[folder] = rec
+    save_identity()
+
+
+def identity_handle(folder):
+    """Current live handle for a folder (the folder name if no rename known)."""
+    return (IDENTITY.get(folder) or {}).get("username") or folder
+
+
+def sync_identity_from_health():
+    """Seed the registry from existing heartbeat results (user-ids + renames)."""
+    for folder, h in HEALTH.items():
+        if h.get("userid"):
+            update_identity(folder, userid=h.get("userid"),
+                            username=(h.get("new_username") or folder))
+
+
 def _il_context():
     """Lazily build a logged-in instaloader context, or None if unavailable.
     Imported lazily so the viewer still runs without instaloader installed."""
@@ -506,35 +589,127 @@ def check_one(name):
         return {"status": "error", "checked": now, "note": str(exc)[:140]}
 
 
-def heartbeat_all(profiles=None):
-    if HEARTBEAT["running"]:
-        return
-    HEARTBEAT["running"] = True
+def save_hb_progress():
     try:
-        names = profiles if profiles is not None else list(INDEX["profiles"].keys())
-        names = sorted(names, key=str.lower)
-        HEARTBEAT["total"], HEARTBEAT["done"] = len(names), 0
-        for i, name in enumerate(names):
+        CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+        data = {k: HEARTBEAT[k] for k in ("queue", "done", "total")}
+        HEARTBEAT_PROGRESS_FILE.write_text(json.dumps(data), encoding="utf-8")
+    except Exception:                                 # noqa: BLE001
+        pass
+
+
+def load_hb_progress():
+    if HEARTBEAT_PROGRESS_FILE.exists():
+        try:
+            d = json.loads(HEARTBEAT_PROGRESS_FILE.read_text(encoding="utf-8"))
+            for k in ("queue", "done", "total"):
+                if k in d:
+                    HEARTBEAT[k] = d[k]
+        except Exception:                             # noqa: BLE001
+            pass
+
+
+def heartbeat_worker():
+    """Drain the heartbeat queue one profile at a time, throttled. Progress is
+    persisted after every check, so an interrupted sweep resumes (on demand)."""
+    HEARTBEAT["running"], HEARTBEAT["stop"] = True, False
+    try:
+        while HEARTBEAT["queue"] and not HEARTBEAT["stop"]:
+            name = HEARTBEAT["queue"][0]
             HEARTBEAT["current"] = name
             res = check_one(name)
             HEALTH[name] = res
+            if res.get("userid"):
+                update_identity(name, userid=res["userid"],
+                                username=res.get("new_username") or name)
+            HEARTBEAT["queue"].pop(0)
             HEARTBEAT["done"] += 1
-            if HEARTBEAT["done"] % 5 == 0:
-                save_health()
+            save_health()
+            save_hb_progress()
+            HEARTBEAT["current"] = ""
             if res.get("status") == "no-session":
                 break                                 # nothing will succeed; stop early
-            if i < len(names) - 1:
-                time.sleep(HEARTBEAT_INTERVAL)         # throttle: protect the account
-        save_health()
-        print("heartbeat complete")
+            waited = 0.0                              # interruptible throttle wait
+            while waited < HEARTBEAT_INTERVAL and not HEARTBEAT["stop"] and HEARTBEAT["queue"]:
+                time.sleep(0.5)
+                waited += 0.5
+        print("heartbeat complete" if not HEARTBEAT["queue"] else "heartbeat stopped")
     finally:
-        HEARTBEAT["running"] = False
-        HEARTBEAT["current"] = ""
+        HEARTBEAT["running"], HEARTBEAT["current"] = False, ""
+        save_hb_progress()
 
 
 def start_heartbeat(profiles=None):
-    threading.Thread(target=heartbeat_all, kwargs={"profiles": profiles},
-                     daemon=True).start()
+    if HEARTBEAT["running"]:
+        return False
+    names = (profiles if profiles is not None
+             else sorted(INDEX["profiles"].keys(), key=str.lower))
+    HEARTBEAT.update({"queue": list(names), "total": len(names), "done": 0,
+                      "stop": False})
+    save_hb_progress()
+    threading.Thread(target=heartbeat_worker, daemon=True).start()
+    return True
+
+
+def resume_heartbeat():
+    if HEARTBEAT["running"] or not HEARTBEAT["queue"]:
+        return False
+    HEARTBEAT["stop"] = False
+    threading.Thread(target=heartbeat_worker, daemon=True).start()
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Quick check — anonymous, login-free, concurrent liveness triage. Hits the
+# public profile page and keys on the <head>'s og:title (present = the account is
+# publicly visible/alive; absent = gone/hidden). No login, no API, no per-account
+# rate-limit risk — just cheap reachability, fired in parallel. The cheap pass
+# that tells you which accounts are worth spending authenticated calls on.
+# ---------------------------------------------------------------------------
+QUICK = {"running": False, "done": 0, "total": 0}
+QUICK_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15")
+
+
+def quick_check_one(name):
+    url = "https://www.instagram.com/%s/" % urllib.parse.quote(name)
+    req = urllib.request.Request(url, headers={"User-Agent": QUICK_UA})
+    now = int(time.time())
+    try:
+        with urllib.request.urlopen(req, timeout=8) as r:
+            head = r.read(60000).decode("utf-8", "replace")  # <head> only; close early
+        alive = ('property="og:title"' in head
+                 or ("(@" + name.lower() + ")") in head.lower())
+        return {"status": "alive" if alive else "dead", "checked": now,
+                "method": "quick"}
+    except Exception as exc:                              # noqa: BLE001
+        return {"status": "error", "checked": now, "method": "quick",
+                "note": str(exc)[:120]}
+
+
+def quick_check_all():
+    if QUICK["running"]:
+        return
+    QUICK["running"] = True
+    try:
+        names = sorted(INDEX["profiles"].keys(), key=str.lower)
+        QUICK["total"], QUICK["done"] = len(names), 0
+
+        def one(n):
+            HEALTH[n] = quick_check_one(n)
+            QUICK["done"] += 1
+
+        with ThreadPoolExecutor(max_workers=15) as ex:  # gentle on the IP
+            list(ex.map(one, names))
+        save_health()
+        print("quick check complete")
+    finally:
+        QUICK["running"] = False
+
+
+def start_quickcheck():
+    if not QUICK["running"]:
+        threading.Thread(target=quick_check_all, daemon=True).start()
 
 
 def start_scan_thread(profiles=None):
@@ -776,15 +951,113 @@ def run_update(profiles):
             pass
 
 
-def _il_run(profile, dirpat, flags, extra=None):
-    """Run one instaloader pass, streaming its output into the profile's job log."""
+# ---------------------------------------------------------------------------
+# Refresh engine — a slow, resumable, throttle-aware background job that brings
+# profiles current via instaloader, ONE at a time with a gap between each, so a
+# whole-archive refresh stays cheap and gentle on Instagram. Progress is tracked
+# and survives restarts (resume a leftover queue).
+# ---------------------------------------------------------------------------
+REFRESH_FILE = CACHE_ROOT / "refresh.json"
+REFRESH_INTERVAL = float(os.environ.get("OFFGRAM_REFRESH_INTERVAL", "180"))
+REFRESH = {"running": False, "paused": False, "stop": False, "current": "",
+           "queue": [], "done": 0, "total": 0, "failed": []}
+REFRESH_LOCK = threading.Lock()
+
+
+def save_refresh():
+    try:
+        CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+        data = {k: REFRESH[k] for k in ("queue", "done", "total", "failed", "paused")}
+        REFRESH_FILE.write_text(json.dumps(data), encoding="utf-8")
+    except Exception:                                 # noqa: BLE001
+        pass
+
+
+def load_refresh():
+    if REFRESH_FILE.exists():
+        try:
+            d = json.loads(REFRESH_FILE.read_text(encoding="utf-8"))
+            for k in ("queue", "done", "total", "failed", "paused"):
+                if k in d:
+                    REFRESH[k] = d[k]
+        except Exception:                             # noqa: BLE001
+            pass
+
+
+def refresh_snapshot():
+    return {"running": REFRESH["running"], "paused": REFRESH["paused"],
+            "current": REFRESH["current"], "done": REFRESH["done"],
+            "total": REFRESH["total"], "queued": len(REFRESH["queue"]),
+            "failed": len(REFRESH["failed"])}
+
+
+def refresh_worker():
+    REFRESH["running"], REFRESH["stop"] = True, False
+    try:
+        while not REFRESH["stop"]:
+            while REFRESH["paused"] and not REFRESH["stop"]:
+                time.sleep(2)
+            if REFRESH["stop"]:
+                break
+            with REFRESH_LOCK:
+                if not REFRESH["queue"]:
+                    break
+                name = REFRESH["queue"][0]
+            REFRESH["current"] = name
+            try:
+                run_update([name])                    # posts + ephemeral + rescan
+            except Exception:                         # noqa: BLE001
+                REFRESH["failed"].append(name)
+            with REFRESH_LOCK:
+                if REFRESH["queue"] and REFRESH["queue"][0] == name:
+                    REFRESH["queue"].pop(0)
+            REFRESH["done"] += 1
+            REFRESH["current"] = ""
+            save_refresh()
+            waited = 0.0                               # interruptible gap before next
+            while waited < REFRESH_INTERVAL and not REFRESH["stop"] and REFRESH["queue"]:
+                time.sleep(1)
+                waited += 1
+    finally:
+        REFRESH["running"], REFRESH["current"] = False, ""
+        save_refresh()
+
+
+def start_refresh(profiles=None):
+    """Begin a new whole-archive (or subset) refresh; skips heartbeat-dead profiles."""
+    if REFRESH["running"]:
+        return False
+    if profiles is None:
+        profiles = [p for p in sorted(INDEX["profiles"], key=str.lower)
+                    if HEALTH.get(p, {}).get("status") != "dead"]
+    REFRESH.update({"queue": list(profiles), "total": len(profiles), "done": 0,
+                    "failed": [], "paused": False, "stop": False})
+    save_refresh()
+    threading.Thread(target=refresh_worker, daemon=True).start()
+    return True
+
+
+def resume_refresh():
+    """Continue a queue left over from a previous run (e.g. after a restart)."""
+    if REFRESH["running"] or not REFRESH["queue"]:
+        return False
+    REFRESH["paused"], REFRESH["stop"] = False, False
+    threading.Thread(target=refresh_worker, daemon=True).start()
+    return True
+
+
+def _il_run(folder, target, dirpat, flags, extra=None):
+    """Run one instaloader pass fetching `target` (the current handle) into the
+    literal `dirpat` folder path. Streams output into folder's job log. Using a
+    literal path (not {target}) keeps a renamed account's content in its original
+    folder and avoids instaloader nesting highlights by collection title."""
     cmd = list(INSTALOADER_CMD) + INSTALOADER_COMMON
     cmd += ["--dirname-pattern=" + dirpat, "--latest-stamps", str(STAMPS_FILE)]
     cmd += list(flags) + list(extra or [])
     if current_login():
         cmd += ["--login", current_login()]
-    cmd += [profile]
-    log = JOBS[profile]["log"]
+    cmd += [target]
+    log = JOBS[folder]["log"]
     log.append("$ " + " ".join(cmd))
     try:
         proc = subprocess.Popen(
@@ -803,17 +1076,20 @@ def _il_run(profile, dirpat, flags, extra=None):
         return -1
 
 
-def _run_one(profile):
-    log = JOBS[profile]["log"]
-    rc = _il_run(profile, "{target}", [], INSTALOADER_EXTRA)     # posts (+ reels, pic)
+def _run_one(folder):
+    log = JOBS[folder]["log"]
+    target = identity_handle(folder)                  # current live handle
+    if target != folder:
+        log.append("--- renamed: fetching @%s into %s/ ---" % (target, folder))
+    rc = _il_run(folder, target, folder, [], INSTALOADER_EXTRA)   # posts -> folder/
     if GRAB_EPHEMERAL:
-        for sub, dirpat, flags in EPHEMERAL_PASSES:
+        for sub, flags in EPHEMERAL_PASSES:
             time.sleep(PASS_DELAY)                     # space out passes to avoid throttling
             log.append("--- fetching %s ---" % sub)
-            _il_run(profile, dirpat, flags)
+            _il_run(folder, target, folder + "/" + sub, flags)   # -> folder/<sub>/
     with JOBS_LOCK:
-        JOBS[profile]["running"] = False
-        JOBS[profile]["rc"] = rc
+        JOBS[folder]["running"] = False
+        JOBS[folder]["rc"] = rc
     log.append("--- finished (exit %s) ---" % rc)
 
 
@@ -843,6 +1119,9 @@ header h1{font-size:17px;margin:0;font-weight:600}
  align-items:center;padding:7px 18px;color:#9a9aa3;font-size:12px;
  background:#121216;border-bottom:1px solid #1c1c22}
 .legend span.dot{margin-right:5px}
+.lf{cursor:pointer;padding:2px 8px;border-radius:6px;display:inline-flex;align-items:center}
+.lf:hover{background:#1e1e24}
+.lf.active{background:#2a2a32;color:#e7e7ea}
 .addbar{margin:0 0 14px;padding:10px 14px;background:#16161a;border:1px solid #2a2a32;
  border-radius:8px;display:none}
 .sp{flex:1}.sub{color:#9a9aa3;font-size:13px}
@@ -933,24 +1212,46 @@ function upd(p){showLog();fetch('/update',{method:'POST',
 function updAll(){if(!confirm('Run instaloader for every profile? This can take a while for large collections.'))return;
  showLog();fetch('/update-all',{method:'POST'}).then(()=>poll(true));}
 function rescan(){fetch('/rescan',{method:'POST'}).then(()=>{location.reload();});}
-function heartbeat(){if(!confirm('Ping Instagram for every profile to check alive/private/gone/renamed? Throttled, and it uses your login session.'))return;
- fetch('/heartbeat',{method:'POST'}).then(hbpoll);}
-function hbpoll(){fetch('/status').then(r=>r.json()).then(j=>{var h=j.heartbeat;
- var el=document.getElementById('hbstat');
- if(h&&h.running){if(el)el.textContent=' · checking '+h.done+'/'+h.total+' '+(h.current||'');
-  setTimeout(hbpoll,1500);}else{location.reload();}});}
+function heartbeat(){if(!confirm('Ping Instagram for every profile to check alive/private/gone/renamed? Throttled, resumable, and uses your login session.'))return;
+ heartbeatCtl('start');}
+function heartbeatCtl(a){fetch('/heartbeat',{method:'POST',
+ headers:{'Content-Type':'application/x-www-form-urlencoded'},
+ body:'action='+a}).then(function(){setTimeout(livePoll,300);});}
 function toggleLog(){var l=document.getElementById('log');
  if(l.style.display==='block'){l.style.display='none';return;}
  l.style.display='block';fetch('/status').then(function(r){return r.json();}).then(renderLog);}
 function switchAcct(){var v=document.getElementById('acct').value;
  fetch('/account',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
   body:'login='+encodeURIComponent(v)}).then(function(){location.reload();});}
+function refreshAll(){if(!confirm('Refresh the whole archive via instaloader? It runs slowly in the background (a profile every few minutes), is pausable, and resumes after restarts. Skips accounts marked dead.'))return;
+ refreshCtl('start');}
+function refreshCtl(a){fetch('/refresh',{method:'POST',
+ headers:{'Content-Type':'application/x-www-form-urlencoded'},
+ body:'action='+a}).then(function(){setTimeout(livePoll,300);});}
+/* Live-update just the progress banner via polling — no full-page reload, so
+   browsing/scroll/lightbox are never interrupted. Index only. */
+function livePoll(){fetch('/banners').then(function(r){return r.json();}).then(function(d){
+ var b=document.getElementById('banners'); if(b)b.innerHTML=d.html;
+ if(d.active){setTimeout(livePoll,4000);}
+ else if(document.querySelectorAll('.card').length===0){location.reload();}});}
 function igName(s){return (s||'').toLowerCase().replace(/^@/,'').replace(/[^a-z0-9._]/g,'');}
+var gstatus='all';
+function filtStatus(el){document.querySelectorAll('.lf').forEach(function(x){x.classList.remove('active');});
+ el.classList.add('active');gstatus=el.dataset.status;
+ var db=document.getElementById('deepbtn');if(db)db.style.display=(gstatus==='all')?'none':'';
+ doSearch();}
+function quickCheck(){fetch('/quickcheck',{method:'POST'}).then(function(){setTimeout(livePoll,300);});}
+function deepCheck(){if(gstatus==='all'){alert('Pick a status filter first (e.g. dead).');return;}
+ if(!confirm('Deep-check the \\''+gstatus+'\\' accounts with the authenticated API? Burns IG calls only on that bucket.'))return;
+ fetch('/heartbeat',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
+  body:'action=start&status='+encodeURIComponent(gstatus)}).then(function(){setTimeout(livePoll,300);});}
 function doSearch(){var q=igName(document.getElementById('search').value);
  var cards=document.querySelectorAll('.card'),any=false,exact=false;
  cards.forEach(function(c){var n=c.getAttribute('data-name')||'';
-  var hit=q===''||n.indexOf(q)>=0;c.style.display=hit?'':'none';
-  if(hit)any=true;if(n===q)exact=true;});
+  var st=c.getAttribute('data-status')||'unchecked';
+  var nameHit=q===''||n.indexOf(q)>=0, statHit=gstatus==='all'||st===gstatus;
+  var hit=nameHit&&statHit;c.style.display=hit?'':'none';
+  if(nameHit)any=true;if(n===q)exact=true;});
  var ab=document.getElementById('addbar');ab.textContent='';
  if(q&&!exact){ab.style.display='block';
   var sp=document.createElement('span');sp.innerHTML='Not archived yet: <b>@'+q+'</b> &nbsp; ';
@@ -966,6 +1267,7 @@ function addProfile(name){name=igName(name);if(!name)return;
  showLog();fetch('/add',{method:'POST',
   headers:{'Content-Type':'application/x-www-form-urlencoded'},
   body:'profile='+encodeURIComponent(name)}).then(function(){poll(true);});}
+if(document.getElementById('banners'))livePoll();   // index: live banner updates, no reload
 """
 
 
@@ -988,9 +1290,54 @@ def scan_banner():
     if SCAN["running"]:
         pct = int(100 * SCAN["done"] / SCAN["total"]) if SCAN["total"] else 0
         return ("<div class='banner'>Indexing the archive… %d/%d profiles (%d%%) — "
-                "currently <b>%s</b>. This page auto-refreshes.</div>"
+                "currently <b>%s</b>.</div>"
                 % (SCAN["done"], SCAN["total"], pct, html.escape(SCAN["current"] or "")))
     return ""
+
+
+def refresh_banner():
+    s = refresh_snapshot()
+    if not s["running"] and not s["queued"]:
+        return ""
+    pct = int(100 * s["done"] / s["total"]) if s["total"] else 0
+    if s["running"]:
+        ctl = ("<button class='btn' onclick=\"refreshCtl('pause')\">⏸ pause</button>"
+               if not s["paused"] else
+               "<button class='btn go' onclick=\"refreshCtl('resume')\">▶ resume</button>")
+        ctl += "<button class='btn' onclick=\"refreshCtl('stop')\">■ stop</button>"
+        state = "paused" if s["paused"] else "running"
+    else:
+        ctl = ("<button class='btn go' onclick=\"refreshCtl('resume')\">▶ resume</button>"
+               "<button class='btn' onclick=\"refreshCtl('stop')\">■ clear</button>")
+        state = "paused (queued from before)"
+    cur = (" · now <b>%s</b>" % html.escape(s["current"])) if s["current"] else ""
+    fail = (" · %d failed" % s["failed"]) if s["failed"] else ""
+    return ("<div class='banner'>Refreshing archive — %d/%d (%d%%) · %s%s%s "
+            "&nbsp; %s</div>" % (s["done"], s["total"], pct, state, cur, fail, ctl))
+
+
+def heartbeat_banner():
+    if not HEARTBEAT["running"] and not HEARTBEAT["queue"]:
+        return ""
+    pct = int(100 * HEARTBEAT["done"] / HEARTBEAT["total"]) if HEARTBEAT["total"] else 0
+    if HEARTBEAT["running"]:
+        ctl = "<button class='btn' onclick=\"heartbeatCtl('stop')\">■ stop</button>"
+        state = "checking"
+    else:
+        ctl = ("<button class='btn go' onclick=\"heartbeatCtl('resume')\">▶ resume</button>"
+               "<button class='btn' onclick=\"heartbeatCtl('stop')\">■ clear</button>")
+        state = "paused (queued from before)"
+    cur = (" · now <b>@%s</b>" % html.escape(HEARTBEAT["current"])) if HEARTBEAT["current"] else ""
+    return ("<div class='banner'>Checking accounts — %d/%d (%d%%) · %s%s &nbsp; %s</div>"
+            % (HEARTBEAT["done"], HEARTBEAT["total"], pct, state, cur, ctl))
+
+
+def quick_check_banner():
+    if not QUICK["running"]:
+        return ""
+    pct = int(100 * QUICK["done"] / QUICK["total"]) if QUICK["total"] else 0
+    return ("<div class='banner'>⚡ Quick liveness check (anonymous) — %d/%d (%d%%)…</div>"
+            % (QUICK["done"], QUICK["total"], pct))
 
 
 HEALTH_COLOR = {"alive": "#3fb950", "private": "#d29922", "dead": "#f85149",
@@ -1014,11 +1361,10 @@ def health_dot(h):
 def render_index():
     with INDEX_LOCK:
         profiles = sorted(INDEX["profiles"].items(), key=lambda kv: kv[0].lower())
-    auto = "<meta http-equiv='refresh' content='4'>" if SCAN["running"] else ""
     if not profiles and SCAN["running"]:
         body = ("<header><h1>offgram</h1><span class='sp'></span></header>"
-                "<div class='wrap'>%s</div>" % scan_banner())
-        return page("indexing…", body).replace("<head>", "<head>" + auto)
+                "<div class='wrap'><div id='banners'>%s</div></div>" % scan_banner())
+        return page("indexing…", body)
     cards = []
     for name, rec in profiles:
         pe = urllib.parse.quote(name)
@@ -1030,25 +1376,50 @@ def render_index():
             img = "<div class='play'>▦</div>"
         bits = ", ".join("%d %s" % (rec["counts"][k], k)
                          for k in SECTIONS if rec["counts"].get(k))
+        handle = identity_handle(name)
+        aliases = (IDENTITY.get(name) or {}).get("aliases") or [name]
+        searchkey = " ".join(sorted(set([name, handle] + aliases))).lower()
+        disp = html.escape(handle)
+        if handle != name:
+            disp += (" <span style='color:#6e7681;font-weight:400;font-size:11px'>"
+                     "(was %s)</span>" % html.escape(name))
         cards.append(
-            "<div class='card' data-name='%s'><a class='thumb' href='/p/%s'>%s"
+            "<div class='card' data-name='%s' data-status='%s'>"
+            "<a class='thumb' href='/p/%s'>%s"
             "<span class='badge'>%d</span></a><div class='meta'>"
             "<b>%s%s</b><div class='s2'>%s</div>"
             "<button class='btn' style='margin-top:8px' onclick=\"upd('%s')\">↻ update</button>"
             "</div></div>"
-            % (html.escape(name.lower()), pe, img, rec["total"],
-               health_dot(HEALTH.get(name)), html.escape(name),
-               html.escape(bits or "empty"), pe))
+            % (html.escape(searchkey),
+               ((HEALTH.get(name) or {}).get("status") or "unchecked"),
+               pe, img, rec["total"], health_dot(HEALTH.get(name)),
+               disp, html.escape(bits or "empty"), pe))
     built = time.strftime("%Y-%m-%d %H:%M", time.localtime(INDEX.get("built", 0)))
+    stcounts = {}
+    for n, _ in profiles:
+        st = (HEALTH.get(n) or {}).get("status") or "unchecked"
+        stcounts[st] = stcounts.get(st, 0) + 1
+
+    def lf(status, label, swatch):
+        cnt = "" if status == "all" else " (%d)" % stcounts.get(status, 0)
+        active = " active" if status == "all" else ""
+        return ("<span class='lf%s' data-status='%s' onclick='filtStatus(this)'>%s%s%s</span>"
+                % (active, status, swatch, label, cnt))
+
+    ring = ("<span class='dot' style='background:transparent;"
+            "box-shadow:inset 0 0 0 1.6px #6e7681'></span>")
+    sw = lambda c: "<span class='dot' style='background:%s'></span>" % c
     legend = ("<div class='legend'>"
-              "<span><span class='dot' style='background:#3fb950'></span>alive</span>"
-              "<span><span class='dot' style='background:#d29922'></span>private</span>"
-              "<span><span class='dot' style='background:#f85149'></span>dead</span>"
-              "<span><span class='dot' style='background:#539bf5'></span>renamed</span>"
-              "<span><span class='dot' style='background:transparent;"
-              "box-shadow:inset 0 0 0 1.6px #6e7681'></span>not checked</span>"
-              "<span style='margin-left:auto;color:#6e7681'>hover a dot for details</span>"
-              "</div>")
+              + lf("all", "all", "")
+              + lf("alive", "alive", sw("#3fb950"))
+              + lf("private", "private", sw("#d29922"))
+              + lf("dead", "dead", sw("#f85149"))
+              + lf("renamed", "renamed", sw("#539bf5"))
+              + lf("unchecked", "not checked", ring)
+              + "<button class='btn' id='deepbtn' style='display:none' "
+              "onclick='deepCheck()'>🔬 deep-check filtered (authenticated)</button>"
+              + "<span style='margin-left:auto;color:#6e7681'>click to filter · "
+              "hover a dot for details</span></div>")
     sessions = list_sessions()
     cur = current_login()
     if sessions:
@@ -1059,20 +1430,21 @@ def render_index():
                 "onchange='switchAcct()'>%s</select>" % opts)
     else:
         acct = "<span class='sub'>no login</span>"
-    body = ("%s<header><h1>offgram</h1>"
+    body = ("<header><h1>offgram</h1>"
             "<input id='search' placeholder='search, or type @name to add…' "
             "oninput='doSearch()' onkeydown='if(event.key===&quot;Enter&quot;)addSearched()'>"
             "<span class='sub'>%d profiles · indexed %s</span>"
-            "<span class='sub' id='hbstat'></span><span class='sp'></span>"
+            "<span class='sp'></span>"
             "<span class='sub'>as</span>%s"
+            "<button class='btn' onclick='quickCheck()'>⚡ Quick check</button>"
             "<button class='btn' onclick='heartbeat()'>♥ Check all</button>"
             "<button class='btn' onclick='rescan()'>⟳ rescan</button>"
-            "<button class='btn go' onclick='updAll()'>↻ Update all</button>"
+            "<button class='btn go' onclick='refreshAll()'>⟲ Refresh all</button>"
             "<button class='btn' onclick='toggleLog()'>▤ log</button></header>"
             "%s<div class='wrap'><div class='addbar' id='addbar'></div>"
-            "%s<div class='grid'>%s</div></div>"
-            % (auto, len(profiles), built, acct, legend, scan_banner(),
-               "".join(cards)))
+            "<div id='banners'>%s%s</div><div class='grid'>%s</div></div>"
+            % (len(profiles), built, acct, legend, scan_banner(),
+               refresh_banner(), "".join(cards)))
     return page("offgram", body)
 
 
@@ -1166,14 +1538,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
             cap, url = read_post_meta(urllib.parse.unquote(qs.get("p", [""])[0]))
             return self._send(200, json.dumps({"caption": cap, "url": url}).encode(),
                               "application/json")
+        if path == "/banners":
+            payload = {"html": (scan_banner() + quick_check_banner()
+                                + heartbeat_banner() + refresh_banner()),
+                       "active": (SCAN["running"] or REFRESH["running"]
+                                  or HEARTBEAT["running"] or QUICK["running"])}
+            return self._send(200, json.dumps(payload).encode(), "application/json")
         if path == "/status":
             with JOBS_LOCK:
                 jobs_running = any(j["running"] for j in JOBS.values())
                 jobs_payload = {k: {"running": v["running"], "log": v["log"][-20:]}
                                 for k, v in JOBS.items()}
-            payload = {"any": jobs_running or SCAN["running"],
+            payload = {"any": (jobs_running or SCAN["running"] or REFRESH["running"]
+                               or HEARTBEAT["running"]),
                        "scan": dict(SCAN), "prewarm": dict(PREWARM),
-                       "heartbeat": dict(HEARTBEAT), "jobs": jobs_payload}
+                       "heartbeat": dict(HEARTBEAT), "refresh": refresh_snapshot(),
+                       "jobs": jobs_payload}
             return self._send(200, json.dumps(payload).encode(), "application/json")
         return self._send(404, b"not found")
 
@@ -1199,10 +1579,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
             start_scan_thread(None)
             return self._send(200, b'{"ok":true}', "application/json")
         if u.path == "/heartbeat":
-            if not HEARTBEAT["running"]:
+            action = form.get("action", ["start"])[0]
+            if action == "stop":
+                HEARTBEAT["stop"] = True
+                HEARTBEAT["queue"] = []
+                save_hb_progress()
+            elif action == "resume":
+                resume_heartbeat()
+            elif not HEARTBEAT["running"]:
+                status = form.get("status", [""])[0]
                 p = form.get("profile", [""])[0]
-                names = [p] if (p and p in INDEX["profiles"]) else None
+                if status:                            # deep-check only this status bucket
+                    names = [n for n in sorted(INDEX["profiles"], key=str.lower)
+                             if (HEALTH.get(n) or {}).get("status") == status]
+                elif p and p in INDEX["profiles"]:
+                    names = [p]
+                else:
+                    names = None
                 start_heartbeat(names)
+            return self._send(200, b'{"ok":true}', "application/json")
+        if u.path == "/quickcheck":
+            start_quickcheck()
             return self._send(200, b'{"ok":true}', "application/json")
         if u.path == "/add":
             p = form.get("profile", [""])[0].strip().lstrip("@").lower()
@@ -1217,6 +1614,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._send(200 if ok else 400,
                               b'{"ok":true}' if ok else b'{"ok":false}',
                               "application/json")
+        if u.path == "/refresh":
+            action = form.get("action", ["start"])[0]
+            if action == "start":
+                start_refresh(None)
+            elif action == "pause":
+                REFRESH["paused"] = True
+            elif action == "resume":
+                if REFRESH["running"]:
+                    REFRESH["paused"] = False
+                else:
+                    resume_refresh()
+            elif action == "stop":
+                REFRESH["stop"] = True
+                with REFRESH_LOCK:
+                    REFRESH["queue"] = []
+                save_refresh()
+            return self._send(200, b'{"ok":true}', "application/json")
         return self._send(404, b"not found")
 
     def serve_thumb(self, rel):
@@ -1288,10 +1702,18 @@ def main():
     load_db_index()
     mimetypes.add_type("video/mp4", ".mp4")
     load_health()
+    load_hb_progress()
+    load_identity()
+    sync_identity_from_health()      # seed registry from any known user-ids / renames
+    load_refresh()
     have_cache = load_index()
+    pending = [p for p in load_scan_pending() if (ROOT / p).is_dir()]
     if not have_cache:
         print("no cache yet — scanning the archive in the background (first run can take a while)…")
         start_scan_thread(None)
+    elif pending:
+        print("resuming interrupted scan: %d profiles left" % len(pending))
+        start_scan_thread(pending)
     else:
         start_prewarm()                              # warm thumbnails for instaloader profiles
     server = ThreadingServer((HOST, PORT), Handler)
