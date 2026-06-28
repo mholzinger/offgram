@@ -31,6 +31,7 @@ import http.server
 import io
 import json
 import lzma
+import math
 import mimetypes
 import os
 import re
@@ -87,6 +88,12 @@ if not _collection:
 COLLECTION = Path(_collection).expanduser()
 ROOT = COLLECTION                          # the archive root
 DB_PATH = ROOT / ".stogram.sqlite"         # optional legacy 4K Stogram db (captions/urls)
+# Advanced import: a *source* 4K Stogram db (a separate, older archive) to pull a
+# folder's captions/urls/dates/identity from, one folder at a time. Read-only; the
+# importer never writes to the source archive or any media file. Default path comes
+# from $OFFGRAM_STOGRAM_DB; can also be set/overridden at runtime from the UI.
+STOGRAM_SOURCE_DB_DEFAULT = os.environ.get("OFFGRAM_STOGRAM_DB", "")
+SIDECAR_NAME = ".offgram-stogram.json"     # offgram's own per-folder rehydrated store
 PORT = int(os.environ.get("OFFGRAM_PORT", "8077"))
 HOST = "127.0.0.1"
 
@@ -185,13 +192,238 @@ def load_db_index():
 
 
 # ---------------------------------------------------------------------------
+# Advanced import — rehydrate one folder from a *source* 4K Stogram db.
+# 4K Stogram keeps one master db per archive with a `subscriptions` row per
+# profile (query == the on-disk folder name) and a `photos` row per item
+# (instagram_id == the mediaid_ownerid token in filenames, plus caption/url/
+# created_time/ownerName/ownerId). We read that db read-only and write a single
+# self-contained <folder>/.offgram-stogram.json — never touching the source
+# archive, the source/destination .stogram.sqlite, or any media file.
+# ---------------------------------------------------------------------------
+STOGRAM_SOURCE_FILE = CACHE_ROOT / "stogram_source.txt"   # remembered source-db path
+
+
+def stogram_source_db():
+    """The source db to import from: a path remembered from the UI, else the
+    $OFFGRAM_STOGRAM_DB default."""
+    try:
+        if STOGRAM_SOURCE_FILE.exists():
+            p = STOGRAM_SOURCE_FILE.read_text(encoding="utf-8").strip()
+            if p:
+                return p
+    except Exception:                                 # noqa: BLE001
+        pass
+    return STOGRAM_SOURCE_DB_DEFAULT
+
+
+def save_stogram_source(path):
+    try:
+        CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+        STOGRAM_SOURCE_FILE.write_text((path or "").strip(), encoding="utf-8")
+    except Exception:                                 # noqa: BLE001
+        pass
+
+
+# Batch-import progress (for the "import all" sweep), surfaced via /status + banner.
+IMPORT = {"running": False, "done": 0, "total": 0, "current": "",
+          "imported": 0, "skipped": 0, "files": 0, "stop": False}
+
+
+def _rehydrate_folder(con, src, folder, row):
+    """Core rehydration for one folder given an open read-only db connection and
+    its subscriptions row. Writes the sidecar, merges CAPTIONS, seeds identity.
+    Idempotent: re-running overwrites the same data, no duplicates. Returns a
+    report dict (ok=False with a note on any problem)."""
+    dest_dir = ROOT / folder
+    if not dest_dir.is_dir():
+        return {"ok": False, "note": "folder not on disk"}
+    sub_id, acct_iid, private, display_name = row
+    caps, owner_name, owner_id = {}, None, None
+    try:
+        for (iid, title, web_url, ctime, is_video,
+             owner_n, owner_i) in con.execute(
+                "SELECT instagram_id, title, web_url, created_time, is_video, "
+                "ownerName, ownerId FROM photos WHERE subscriptionId=?", (sub_id,)):
+            if not iid:
+                continue
+            caps[iid] = {"caption": title or "", "url": web_url or "",
+                         "ts": ctime or 0, "v": 1 if is_video else 0}
+            owner_name = owner_name or owner_n
+            owner_id = owner_id or owner_i
+    except Exception as exc:                          # noqa: BLE001
+        return {"ok": False, "note": "db read failed: %s" % exc}
+    owner_id = str(owner_id or acct_iid or "")
+    owner_name = owner_name or display_name or folder
+    # how many of this folder's on-disk media match a db row (by id token)?
+    rec = INDEX["profiles"].get(folder, {})
+    disk_tokens = set()
+    for entries in rec.get("sections", {}).values():
+        for fn, _ in entries:
+            m = ID_RE.search(fn)
+            if m:
+                disk_tokens.add(m.group(1))
+    matched = len(disk_tokens & set(caps))
+    sidecar = {"source": str(src), "imported": int(time.time()), "folder": folder,
+               "identity": {"ownerName": owner_name, "ownerId": owner_id,
+                            "private": int(private or 0),
+                            "display_name": display_name or folder},
+               "captions": caps}
+    try:
+        (dest_dir / SIDECAR_NAME).write_text(json.dumps(sidecar), encoding="utf-8")
+    except Exception as exc:                          # noqa: BLE001
+        return {"ok": False, "note": "could not write sidecar: %s" % exc}
+    CAPTIONS.update(caps)                              # live; captions show on reload
+    if owner_id:
+        update_identity(folder, userid=owner_id, username=owner_name)
+    return {"ok": True, "folder": folder, "db_rows": len(caps),
+            "disk_files": len(disk_tokens), "matched": matched,
+            "ownerName": owner_name, "ownerId": owner_id,
+            "private": int(private or 0), "source": str(src)}
+
+
+def _open_source_db(db_path):
+    """Open a source 4K Stogram db read-only/immutable, or (None, error-note)."""
+    src = Path(db_path).expanduser()
+    if not src.is_file():
+        return None, None, "source db not found: %s" % db_path
+    uri = "file:%s?mode=ro&immutable=1" % urllib.parse.quote(str(src))
+    try:
+        return sqlite3.connect(uri, uri=True), src, None
+    except Exception as exc:                           # noqa: BLE001
+        return None, src, "cannot open db: %s" % exc
+
+
+def import_from_stogram(folder, db_path):
+    """Pull one folder's captions/urls/dates/identity from a source 4K Stogram db
+    into <folder>/.offgram-stogram.json and merge them into the live CAPTIONS
+    index (no restart needed). Read-only on the source; returns a report dict."""
+    if folder not in INDEX["profiles"]:
+        return {"ok": False, "note": "unknown folder '%s'" % folder}
+    con, src, err = _open_source_db(db_path)
+    if con is None:
+        return {"ok": False, "note": err}
+    try:
+        row = con.execute(
+            "SELECT id, instagram_id, private, display_name FROM subscriptions "
+            "WHERE query=? COLLATE NOCASE", (folder,)).fetchone()
+        if not row:
+            return {"ok": False,
+                    "note": "no subscription for '%s' in this db" % folder}
+        res = _rehydrate_folder(con, src, folder, row)
+    finally:
+        con.close()
+    if res.get("ok"):
+        print("imported %s: %d db rows, %d/%d on-disk files matched"
+              % (folder, res["db_rows"], res["matched"], res["disk_files"]))
+    return res
+
+
+def import_all_from_stogram(db_path):
+    """Idempotently rehydrate *every* indexed folder that has a matching
+    subscription in the source db, in a single pass over the db (one open, one
+    subscriptions read, then an indexed per-folder photos query). Safe to re-run.
+    Tracks progress in IMPORT; returns a summary dict."""
+    if IMPORT["running"]:
+        return {"ok": False, "note": "an import is already running"}
+    con, src, err = _open_source_db(db_path)
+    if con is None:
+        return {"ok": False, "note": err}
+    IMPORT.update({"running": True, "done": 0, "total": 0, "current": "",
+                   "imported": 0, "skipped": 0, "files": 0, "stop": False})
+    matched_folders, no_match, errors, total_files = [], [], [], 0
+    try:
+        # subscriptions keyed by lower(query) for case-insensitive folder matching
+        subs = {}
+        for (sid, q, acct_iid, private, dname) in con.execute(
+                "SELECT id, query, instagram_id, private, display_name "
+                "FROM subscriptions"):
+            if q:
+                subs[q.lower()] = (sid, acct_iid, private, dname)
+        with INDEX_LOCK:
+            folders = sorted(INDEX["profiles"].keys(), key=str.lower)
+        IMPORT["total"] = len(folders)
+        for folder in folders:
+            if IMPORT["stop"]:
+                break
+            IMPORT["current"] = folder
+            row = subs.get(folder.lower())
+            if row is None:
+                no_match.append(folder)
+                IMPORT["skipped"] += 1
+            else:
+                res = _rehydrate_folder(con, src, folder, row)
+                if res.get("ok"):
+                    matched_folders.append(folder)
+                    total_files += res["matched"]
+                    IMPORT["imported"] += 1
+                    IMPORT["files"] += res["matched"]
+                else:
+                    errors.append("%s: %s" % (folder, res.get("note", "?")))
+            IMPORT["done"] += 1
+    except Exception as exc:                           # noqa: BLE001
+        errors.append("sweep failed: %s" % exc)
+    finally:
+        con.close()
+        IMPORT["running"], IMPORT["current"] = False, ""
+    print("import-all: %d imported, %d no-match, %d errors, %d files matched"
+          % (len(matched_folders), len(no_match), len(errors), total_files))
+    return {"ok": True, "source": str(src) if src else db_path,
+            "scanned": len(matched_folders) + len(no_match),
+            "imported": len(matched_folders), "no_match": len(no_match),
+            "errors": errors[:20], "files": total_files,
+            "stopped": IMPORT["stop"]}
+
+
+def start_import_all(db_path):
+    """Run import_all_from_stogram on a background thread."""
+    if IMPORT["running"]:
+        return False
+    threading.Thread(target=import_all_from_stogram, args=(db_path,),
+                     daemon=True).start()
+    return True
+
+
+def load_folder_sidecars():
+    """Merge any per-folder .offgram-stogram.json (written by the importer) into
+    CAPTIONS and seed identities, so rehydrated data persists without the source
+    db attached. The root-level db (load_db_index) stays authoritative."""
+    n_files = n_caps = 0
+    try:
+        with os.scandir(ROOT) as it:
+            folders = [e.name for e in it if e.is_dir() and not is_hidden(e.name)]
+    except FileNotFoundError:
+        return
+    for folder in folders:
+        sc = ROOT / folder / SIDECAR_NAME
+        if not sc.is_file():
+            continue
+        try:
+            data = json.loads(sc.read_text(encoding="utf-8"))
+        except Exception:                             # noqa: BLE001
+            continue
+        for iid, info in (data.get("captions") or {}).items():
+            CAPTIONS.setdefault(iid, {"caption": info.get("caption", ""),
+                                      "url": info.get("url", ""),
+                                      "ts": info.get("ts", 0)})
+        ident = data.get("identity") or {}
+        if ident.get("ownerId"):
+            update_identity(folder, userid=ident["ownerId"],
+                            username=ident.get("ownerName") or folder)
+        n_files += 1
+        n_caps += len(data.get("captions") or {})
+    if n_files:
+        print("loaded %d captions from %d imported sidecar(s)" % (n_caps, n_files))
+
+
+# ---------------------------------------------------------------------------
 # Index: the cached map of the whole collection (built once by scanning the archive)
 # ---------------------------------------------------------------------------
 # INDEX = {"built": ts, "profiles": {name: {counts, total, cover, mtime,
 #           sections: {sec: [[filename, has_sidecar], ...]}}}}
 INDEX = {"built": 0, "profiles": {}}
 INDEX_LOCK = threading.Lock()
-SCAN = {"running": False, "done": 0, "total": 0, "current": ""}
+SCAN = {"running": False, "done": 0, "total": 0, "current": "",
+        "added": [], "removed": []}   # summary of the last scan (for UI feedback)
 
 
 def is_hidden(name):
@@ -320,7 +552,9 @@ def rescan(profiles=None, full=False):
     try:
         full_scan = profiles is None
         names = profiles if profiles is not None else list_profile_names()
+        before = set(INDEX["profiles"].keys())        # for the added/removed summary
         SCAN["total"], SCAN["done"] = len(names), 0
+        SCAN["added"], SCAN["removed"] = [], []
         pending = set(names)
         save_scan_progress(pending)
         # Scan profiles in parallel: the cost is per-directory I/O latency (worst
@@ -349,10 +583,14 @@ def rescan(profiles=None, full=False):
             with INDEX_LOCK:
                 for gone in [p for p in INDEX["profiles"] if p not in live]:
                     del INDEX["profiles"][gone]
+        after = set(INDEX["profiles"].keys())
+        SCAN["added"] = sorted(after - before, key=str.lower)
+        SCAN["removed"] = sorted(before - after, key=str.lower)
         INDEX["built"] = int(time.time())
         save_index()
         save_scan_progress(set())                     # done — nothing pending
-        print("scan complete: %d profiles" % len(INDEX["profiles"]))
+        print("scan complete: %d profiles (+%d new, -%d removed)"
+              % (len(INDEX["profiles"]), len(SCAN["added"]), len(SCAN["removed"])))
         start_prewarm()
     finally:
         SCAN["running"] = False
@@ -795,6 +1033,211 @@ def list_set_folder(folder, names):
     return True
 
 
+# ---------------------------------------------------------------------------
+# Merges — squash several profiles (e.g. an abandoned + a revived + a deleted
+# account from the same creator) into one combined "omnibus" timeline. Purely a
+# virtual, non-destructive grouping: no files move, each post keeps its own
+# metadata, and the combined view just aggregates members' items sorted by time.
+# Members are collapsed out of the main grid behind a single merge tile.
+#   MERGES = {merge_id: {name, members:[folders], primary:folder|None, created}}
+# ---------------------------------------------------------------------------
+MERGES = {}
+MERGES_FILE = CACHE_ROOT / "merges.json"
+
+
+def load_merges():
+    global MERGES
+    if MERGES_FILE.exists():
+        try:
+            MERGES = json.loads(MERGES_FILE.read_text(encoding="utf-8"))
+        except Exception:                             # noqa: BLE001
+            MERGES = {}
+
+
+def save_merges():
+    try:
+        CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+        MERGES_FILE.write_text(json.dumps(MERGES), encoding="utf-8")
+    except Exception:                                 # noqa: BLE001
+        pass
+
+
+def merge_slug(name):
+    s = re.sub(r"[^a-z0-9]+", "-", (name or "").lower()).strip("-")
+    return s[:60] or "merge"
+
+
+def merged_members():
+    """Every folder currently absorbed into some merge."""
+    out = set()
+    for m in MERGES.values():
+        out.update(m.get("members", []))
+    return out
+
+
+def merge_of(folder):
+    for mid, m in MERGES.items():
+        if folder in m.get("members", []):
+            return mid
+    return None
+
+
+def create_merge(name, members, primary=None):
+    members = [f for f in members if f in INDEX["profiles"]]
+    if len(members) < 2:
+        return None
+    if not name:
+        name = identity_handle(primary) if primary in members else members[0]
+    mid, base, i = merge_slug(name), merge_slug(name), 2
+    while mid in MERGES:
+        mid = "%s-%d" % (base, i)
+        i += 1
+    MERGES[mid] = {"name": (name or mid).strip()[:80], "members": members,
+                   "primary": primary if primary in members else None,
+                   "created": int(time.time())}
+    save_merges()
+    return mid
+
+
+def delete_merge(mid):
+    if mid in MERGES:
+        del MERGES[mid]
+        save_merges()
+        return True
+    return False
+
+
+def rename_merge(mid, name):
+    name = (name or "").strip()[:80]
+    if mid in MERGES and name:
+        MERGES[mid]["name"] = name
+        save_merges()
+        return True
+    return False
+
+
+def merge_cover(m):
+    """(folder, coverfile) for a merge tile: the primary's cover, else the first
+    member that has one."""
+    order = ([m["primary"]] if m.get("primary") else []) + m.get("members", [])
+    for f in order:
+        rec = INDEX["profiles"].get(f)
+        if rec and rec.get("cover"):
+            return f, rec["cover"]
+    return None, None
+
+
+def merge_total(m):
+    return sum(INDEX["profiles"].get(f, {}).get("total", 0)
+               for f in m.get("members", []))
+
+
+def merge_items(m):
+    """All members' items, each tagged with its source folder, merged into one
+    timeline sorted newest-first. Cross-account ids never collide, so no dedup."""
+    items = []
+    for f in m.get("members", []):
+        for it in profile_items(f):
+            it = dict(it)
+            it["src"] = f
+            items.append(it)
+    items.sort(key=lambda x: (x["ts"], x["rel"]), reverse=True)
+    return items
+
+
+def _group_near(keyed, thr):
+    """Connected components of keys whose 64-bit pHashes are within Hamming `thr`.
+    Scales via LSH banding: two hashes within thr bits must share at least one of
+    (thr+1) contiguous bit-bands exactly (pigeonhole), so we only compare items
+    that collide in a band — not all pairs. Returns list of lists of keys."""
+    n = len(keyed)
+    parent = list(range(n))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    hints = [h for _, h in keyed]
+    bands = 1 if thr <= 0 else thr + 1
+    cuts = [(i * 64) // bands for i in range(bands + 1)]
+    for bi in range(bands):
+        lo, hi = cuts[bi], cuts[bi + 1]
+        shift, mask = 64 - hi, (1 << (hi - lo)) - 1
+        buckets = {}
+        for idx in range(n):
+            buckets.setdefault((hints[idx] >> shift) & mask, []).append(idx)
+        for grp in buckets.values():
+            if len(grp) < 2:
+                continue
+            for i in range(len(grp)):
+                hi_ = hints[grp[i]]
+                for j in range(i + 1, len(grp)):
+                    if bin(hi_ ^ hints[grp[j]]).count("1") <= thr:
+                        ra, rb = find(grp[i]), find(grp[j])
+                        if ra != rb:
+                            parent[ra] = rb
+    comps = {}
+    for idx in range(n):
+        comps.setdefault(find(idx), []).append(keyed[idx][0])
+    return list(comps.values())
+
+
+def merge_items_deduped(m, threshold=14, cap=12):
+    """merge_items() collapsed by near-identical pHash (Hamming <= threshold).
+    Each output item is the best-quality copy of its group (largest file; parent
+    wins ties) carrying a `dups` list of every copy's source/caption/url/ts. Items
+    with no cached hash pass through as singletons.
+
+    Quick guard: a real repost makes a small group (a handful of copies). When
+    loose matching chains look-alike low-detail images into a runaway blob bigger
+    than `cap`, we DON'T collapse it — those posts stay individual (erring toward
+    not-merging). cap=0 disables the guard. Returns (items, coverage, oversized)."""
+    items = merge_items(m)
+    primary = m.get("primary")
+    by_rel = {it["rel"]: it for it in items}
+    keyed = [(it["rel"], int(PHASH[it["rel"]], 16))
+             for it in items if it["rel"] in PHASH]
+    rel_group, oversized = {}, 0
+    for comp in _group_near(keyed, threshold):
+        if len(comp) > 1:
+            if cap and len(comp) > cap:
+                oversized += 1                # runaway chain — leave posts intact
+                continue
+            for rel in comp:
+                rel_group[rel] = comp
+
+    def quality_key(it):
+        try:
+            sz = (ROOT / it["rel"]).stat().st_size
+        except OSError:
+            sz = 0
+        return (sz, 1 if it.get("src") == primary else 0)
+
+    out, used = [], set()
+    for it in items:
+        comp = rel_group.get(it["rel"])
+        if comp is None:
+            o = dict(it)
+            o["n"], o["dups"] = 1, []
+            out.append(o)
+            continue
+        gid = id(comp)
+        if gid in used:
+            continue
+        used.add(gid)
+        grp = [by_rel[r] for r in comp]
+        o = dict(max(grp, key=quality_key))
+        o["n"] = len(grp)
+        o["dups"] = [{"src": g.get("src", ""), "caption": g.get("caption", ""),
+                      "url": g.get("url", ""), "ts": g.get("ts", 0)}
+                     for g in sorted(grp, key=lambda x: x.get("ts", 0))]
+        out.append(o)
+    out.sort(key=lambda x: (x["ts"], x["rel"]), reverse=True)
+    return out, (len(keyed) / len(items) if items else 1.0), oversized
+
+
 def list_assign(name, folders):
     """Add a batch of folders to one list (bulk assign). Creates the list."""
     name = norm_list_name(name)
@@ -821,8 +1264,8 @@ BACKUP_DIR = CACHE_ROOT / "backups"
 
 def backup_paths():
     return [INDEX_FILE, HEARTBEAT_FILE, HEARTBEAT_PROGRESS_FILE, IDENTITY_FILE,
-            TRACKING_FILE, HIDDEN_FILE, DISMISSED_FILE, LISTS_FILE, ACCOUNT_FILE,
-            STAMPS_FILE, REFRESH_FILE, SCAN_FILE]
+            TRACKING_FILE, HIDDEN_FILE, DISMISSED_FILE, LISTS_FILE, MERGES_FILE,
+            PHASH_FILE, ACCOUNT_FILE, STAMPS_FILE, REFRESH_FILE, SCAN_FILE]
 
 
 def _human_size(n):
@@ -940,6 +1383,8 @@ def restore_backup(name):
     load_hidden()
     load_dismissed()
     load_lists()
+    load_merges()
+    load_phash()
     load_refresh()
     ACTIVE_LOGIN = None                                # re-read account.txt lazily
     _il["ctx"], _il["tried"] = None, False
@@ -1248,6 +1693,125 @@ def cached_thumb(full):
             if os.path.exists(tmp):
                 os.remove(tmp)
     return out if out.exists() else None
+
+
+# ---------------------------------------------------------------------------
+# Perceptual hashing for merge dedup. We compute a DCT-based pHash of the cached
+# thumbnail (videos: their poster frame). pHash is robust to Instagram's per-
+# account re-encoding (dHash was not — measured 7-17 bit drift on real reposts),
+# so the same photo on two accounts lands within a few bits and dedup groups them
+# by Hamming distance (tunable threshold). Hashes are cached (phash.json) and
+# built in a background job. Reuses ffmpeg — no new deps.
+# ---------------------------------------------------------------------------
+PHASH = {}                                 # rel -> 16-hex 64-bit pHash of its thumbnail
+PHASH_FILE = CACHE_ROOT / "phash.json"
+# DCT-II cosine table: 8 low-freq basis vectors over 32 samples (computed once).
+_PH_N, _PH_K = 32, 8
+_PH_COS = [[math.cos(math.pi * (2 * n + 1) * k / (2 * _PH_N))
+            for n in range(_PH_N)] for k in range(_PH_K)]
+PHASHJOB = {"running": False, "done": 0, "total": 0, "current": "",
+            "mid": "", "stop": False}
+
+
+def load_phash():
+    global PHASH
+    if PHASH_FILE.exists():
+        try:
+            PHASH = json.loads(PHASH_FILE.read_text(encoding="utf-8"))
+        except Exception:                             # noqa: BLE001
+            PHASH = {}
+
+
+def save_phash():
+    try:
+        CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+        PHASH_FILE.write_text(json.dumps(PHASH), encoding="utf-8")
+    except Exception:                                 # noqa: BLE001
+        pass
+
+
+def _phash_from_gray32(buf):
+    """DCT-II pHash of a 32x32 gray frame: take the top-left 8x8 low-frequency
+    block, threshold each coefficient at the block's median (excluding DC) -> 64
+    bits. Robust to re-compression/resize. buf is 1024 gray bytes."""
+    N, K, cos = _PH_N, _PH_K, _PH_COS
+    # separable DCT, keeping only the K lowest frequencies on each axis
+    tmp = [[0.0] * K for _ in range(N)]               # rows -> N x K
+    for r in range(N):
+        base = r * N
+        for k in range(K):
+            ck = cos[k]
+            s = 0.0
+            for n in range(N):
+                s += ck[n] * buf[base + n]
+            tmp[r][k] = s
+    flat = []
+    for k1 in range(K):                               # cols -> K x K
+        ck = cos[k1]
+        for k2 in range(K):
+            s = 0.0
+            for r in range(N):
+                s += ck[r] * tmp[r][k2]
+            flat.append(s)
+    med = sorted(flat[1:])[len(flat[1:]) // 2]         # median, excluding DC term
+    bits = 0
+    for v in flat:
+        bits = (bits << 1) | (1 if v > med else 0)
+    return "%016x" % bits
+
+
+def compute_phash(rel):
+    if rel in PHASH:
+        return PHASH[rel]
+    full = safe_under_root(rel)
+    if not full:
+        return None
+    thumb = cached_thumb(full)                         # poster frame for videos
+    if not thumb:
+        return None
+    try:
+        r = subprocess.run(["ffmpeg", "-nostdin", "-i", str(thumb),
+                            "-vf", "scale=32:32,format=gray", "-f", "rawvideo", "-"],
+                           capture_output=True, timeout=20)
+        if len(r.stdout) < 1024:
+            return None
+        PHASH[rel] = _phash_from_gray32(r.stdout[:1024])
+        return PHASH[rel]
+    except Exception:                                 # noqa: BLE001
+        return None
+
+
+def hash_merge_members(mid):
+    """Background pass: compute (and cache) the dHash for every not-yet-hashed
+    item across a merge's members, so the deduped view has full coverage."""
+    m = MERGES.get(mid)
+    if not m or PHASHJOB["running"]:
+        return
+    todo = [it["rel"] for it in merge_items(m) if it["rel"] not in PHASH]
+    PHASHJOB.update({"running": True, "done": 0, "total": len(todo),
+                     "current": "", "mid": mid, "stop": False})
+
+    def one(rel):
+        if not PHASHJOB["stop"]:
+            compute_phash(rel)
+        PHASHJOB["done"] += 1
+        if PHASHJOB["done"] % 200 == 0:
+            save_phash()
+
+    try:
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            list(ex.map(one, todo))
+        save_phash()
+        print("dedupe hashing complete for %s (%d new)" % (mid, len(todo)))
+    finally:
+        PHASHJOB["running"] = False
+
+
+def start_phash_job(mid):
+    if PHASHJOB["running"]:
+        return False
+    threading.Thread(target=hash_merge_members, args=(mid,), daemon=True).start()
+    return True
 
 
 def _caption_from_node(node):
@@ -1598,6 +2162,20 @@ body.selmode .card .sel{display:block}
 .cell{aspect-ratio:1/1;background:#000;position:relative;cursor:pointer;
  border-radius:6px;overflow:hidden}
 .cell img{width:100%;height:100%;object-fit:cover}
+.srctag{position:absolute;left:4px;top:4px;max-width:90%;overflow:hidden;
+ text-overflow:ellipsis;white-space:nowrap;background:rgba(0,0,0,.62);color:#fff;
+ font-size:10px;line-height:1.5;padding:1px 6px;border-radius:5px;pointer-events:none}
+body.hidesrc .srctag{display:none}
+.dupbadge{position:absolute;right:4px;top:4px;background:#539bf5;color:#fff;
+ font-size:10px;line-height:1.5;padding:1px 6px;border-radius:8px;font-weight:600;
+ pointer-events:none}
+.dupg{margin-top:8px;padding-top:6px;border-top:1px solid rgba(255,255,255,.12)}
+.mchips{margin:0 0 14px;color:#9a9aa3;font-size:13px}
+.mchip{display:inline-block;margin:0 6px 6px 0;padding:2px 9px;border-radius:10px;
+ background:#1c1c22;border:1px solid #2a2a32;color:#c9c9d0;text-decoration:none}
+.mchip:hover{border-color:#539bf5}
+.card.mergecard{outline:1px solid #2c5fb3;outline-offset:-1px}
+.card.mergecard .meta b{color:#86b7ff}
 .banner{background:#23314a;border:1px solid #2c5fb3;border-radius:8px;
  padding:10px 14px;margin:0 0 16px}
 #log{position:fixed;right:0;bottom:0;width:min(540px,100%);max-height:48vh;
@@ -1619,25 +2197,48 @@ body.selmode .card .sel{display:block}
  padding:0 18px;user-select:none;transform:translateY(-50%)}
 #lb .nav.l{left:0}#lb .nav.r{right:0}
 #lb .close{position:fixed;top:14px;right:20px;font-size:30px;cursor:pointer}
+#lb .mute{position:fixed;top:16px;left:20px;font-size:24px;cursor:pointer;
+ user-select:none;display:none;z-index:55;line-height:1}
 """
 
 JS_COMMON = """
 let ITEMS=[],cur=0;
+var MUTED=true;try{MUTED=localStorage.getItem('og_muted')!=='0';}catch(e){}  /* default: muted */
+function applyMuteBtn(show){var b=document.getElementById('mute');if(!b)return;
+ b.style.display=show?'block':'none';b.textContent=MUTED?'🔇':'🔊';
+ b.title=MUTED?'Muted — click for sound':'Sound on — click to mute';}
+function toggleMute(){MUTED=!MUTED;try{localStorage.setItem('og_muted',MUTED?'1':'0');}catch(e){}
+ var v=document.querySelector('#lb .stage video');if(v){v.muted=MUTED;if(!MUTED){var p=v.play();if(p&&p.catch)p.catch(function(){});}}
+ applyMuteBtn(true);}
 function openLB(i){cur=i;renderLB();document.getElementById('lb').style.display='flex';}
 function closeLB(){document.getElementById('lb').style.display='none';
- let s=document.querySelector('#lb .stage');if(s)s.innerHTML='';}
+ let s=document.querySelector('#lb .stage');
+ if(s){var v=s.querySelector('video');if(v){v.pause();v.removeAttribute('src');v.load();}s.innerHTML='';}}
 function step(d){cur=(cur+d+ITEMS.length)%ITEMS.length;renderLB();}
 function escapeHTML(s){return s.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
 function renderLB(){let it=ITEMS[cur];let s=document.querySelector('#lb .stage');
  let m='/media?p='+encodeURIComponent(it.rel);
  s.innerHTML=it.kind==='video'
-  ?'<video src="'+m+'" controls autoplay playsinline></video>'
+  ?'<video src="'+m+'" controls autoplay playsinline'+(MUTED?' muted':'')+'></video>'
   :'<img src="'+m+'">';
+ if(it.kind==='video'){var v=s.querySelector('video');if(v)v.muted=MUTED;}
+ applyMuteBtn(it.kind==='video');
  let when=it.ts?new Date(it.ts*1000).toLocaleString():'';
  let link=it.url?' &nbsp;·&nbsp; <a href="'+it.url+'" target="_blank">open original ↗</a>':'';
  let cap=document.getElementById('cap');
- cap.innerHTML='<b>'+it.section+'</b> &nbsp; '+when+link+'<br>'+
-  (it.caption?escapeHTML(it.caption):(it.sc?'<i>loading caption…</i>':'<i>no caption</i>'));
+ if(it.dups&&it.dups.length>1){
+  let h='<b>'+it.section+'</b> &nbsp;·&nbsp; <span class="sub">'+it.dups.length+' copies across accounts</span>';
+  it.dups.forEach(function(g){
+   let w=g.ts?new Date(g.ts*1000).toLocaleDateString():'';
+   let l=g.url?' &nbsp;·&nbsp; <a href="'+g.url+'" target="_blank">↗</a>':'';
+   h+='<div class="dupg"><b>@'+escapeHTML(g.src||'')+'</b> <span class="sub">'+w+'</span>'+l+'<br>'+
+      (g.caption?escapeHTML(g.caption):'<i>no caption</i>')+'</div>';});
+  cap.innerHTML=h;
+ }else{
+  let src=it.src?'<b>@'+escapeHTML(it.src)+'</b> &nbsp;·&nbsp; ':'';
+  cap.innerHTML=src+'<b>'+it.section+'</b> &nbsp; '+when+link+'<br>'+
+   (it.caption?escapeHTML(it.caption):(it.sc?'<i>loading caption…</i>':'<i>no caption</i>'));
+ }
  if(!it.caption&&it.sc){it.sc=0;fetch('/caption?p='+encodeURIComponent(it.rel))
   .then(r=>r.json()).then(d=>{if(d.caption)it.caption=d.caption;if(d.url)it.url=d.url;
    if(ITEMS[cur]===it)renderLB();});}}
@@ -1659,7 +2260,23 @@ function upd(p){showLog();fetch('/update',{method:'POST',
  body:'profile='+encodeURIComponent(p)}).then(()=>poll(true));}
 function updAll(){if(!confirm('Run instaloader for every profile? This can take a while for large collections.'))return;
  showLog();fetch('/update-all',{method:'POST'}).then(()=>poll(true));}
-function rescan(){fetch('/rescan',{method:'POST'}).then(()=>{location.reload();});}
+function rescan(){fetch('/rescan',{method:'POST'}).then(function(){
+ /* /rescan only *starts* a background scan; wait for it to finish before
+    reloading, else new folders aren't in the index yet and look missed. */
+ var seen=false,n=0;
+ var t=setInterval(function(){n++;
+  fetch('/status').then(function(r){return r.json();}).then(function(s){
+   var sc=(s&&s.scan)||{},run=!!sc.running;
+   if(run)seen=true;
+   if((seen&&!run)||(!seen&&n>=4)||n>200){clearInterval(t);
+    var a=sc.added||[],d=sc.removed||[];
+    var msg='Rescan complete — '+(sc.total||0)+' folder'+(sc.total===1?'':'s')+' scanned.';
+    if(a.length)msg+='\\n\\n+ '+a.length+' new: '+a.slice(0,10).join(', ')+(a.length>10?'…':'');
+    if(d.length)msg+='\\n\\n\\u2212 '+d.length+' removed: '+d.slice(0,10).join(', ')+(d.length>10?'…':'');
+    if(!a.length&&!d.length)msg+='\\n\\nNo new or removed folders.';
+    alert(msg);location.reload();}
+  }).catch(function(){});
+ },1500);});}
 function heartbeat(){if(!confirm('Ping Instagram for every profile to check alive/private/gone/renamed? Throttled, resumable, and uses your login session.'))return;
  heartbeatCtl('start');}
 function heartbeatCtl(a){fetch('/heartbeat',{method:'POST',
@@ -1682,6 +2299,46 @@ function livePoll(){fetch('/banners').then(function(r){return r.json();}).then(f
  var b=document.getElementById('banners'); if(b)b.innerHTML=d.html;
  if(d.active){setTimeout(livePoll,4000);}
  else if(document.querySelectorAll('.card').length===0){location.reload();}});}
+/* ---- leak-debug overlay: opt-in via ?debug=1 or Shift+D. Wraps fetch + interval
+   timers and samples DOM node count / JS heap (Chrome only) over time, so a slow
+   leak is visible in minutes. Rates are vs the first sample; history is in
+   window.__leak.hist (copy(JSON.stringify(__leak.hist)) to export). ---- */
+var __leak={fetches:0,timers:0,peak:0,hist:[],base:null,box:null,iv:null,t0:0};
+(function(){var of=window.fetch;window.fetch=function(){__leak.fetches++;return of.apply(this,arguments);};
+ var osi=window.setInterval,oci=window.clearInterval;__leak._osi=osi;__leak._oci=oci;
+ window.setInterval=function(){__leak.timers++;if(__leak.timers>__leak.peak)__leak.peak=__leak.timers;return osi.apply(this,arguments);};
+ window.clearInterval=function(id){if(__leak.timers>0)__leak.timers--;return oci.call(this,id);};})();
+function leakSample(){
+ var s={sec:Math.round((Date.now()-__leak.t0)/1000),
+  nodes:document.getElementsByTagName('*').length,
+  heap:(window.performance&&performance.memory)?performance.memory.usedJSHeapSize:0,
+  fetches:__leak.fetches,timers:__leak.timers};
+ if(!__leak.base)__leak.base=s;
+ __leak.hist.push(s); if(__leak.hist.length>720)__leak.hist.shift();   /* bounded: ~24min @2s */
+ return s;}
+function leakRender(){var s=leakSample(),b=__leak.base,mins=Math.max(s.sec-b.sec,1)/60;
+ function rate(c,w){return (c-w)/mins;}
+ var heapTxt=s.heap?((s.heap/1048576).toFixed(1)+'MB  (+'+(rate(s.heap,b.heap)/1048576).toFixed(2)+'/min)')
+  :'n/a (use Web Inspector)';
+ __leak.box.textContent=
+  'LEAK  '+Math.floor(s.sec/60)+'m'+(s.sec%60)+'s\\n'+
+  'nodes  '+s.nodes+'  (+'+rate(s.nodes,b.nodes).toFixed(1)+'/min)\\n'+
+  'heap   '+heapTxt+'\\n'+
+  'fetch  '+s.fetches+'  ('+rate(s.fetches,b.fetches).toFixed(0)+'/min)\\n'+
+  'timers '+s.timers+'  (peak '+__leak.peak+')';}
+function leakToggle(on){var want=(on===undefined)?!__leak.box:on;
+ if(want&&!__leak.box){__leak.t0=Date.now();__leak.base=null;
+  var d=document.createElement('div');d.id='leakbox';
+  d.style.cssText='position:fixed;left:8px;bottom:8px;z-index:9999;background:rgba(0,0,0,.82);'
+   +'color:#7fe08a;font:11px/1.4 ui-monospace,Menlo,monospace;white-space:pre;padding:8px 10px;'
+   +'border:1px solid #2a2a32;border-radius:8px;pointer-events:none';
+  document.body.appendChild(d);__leak.box=d;leakRender();
+  __leak.iv=__leak._osi(leakRender,2000);}
+ else if(!want&&__leak.box){__leak._oci(__leak.iv);__leak.box.remove();__leak.box=null;__leak.iv=null;}}
+document.addEventListener('keydown',function(e){
+ if(/INPUT|TEXTAREA/.test((e.target||{}).tagName||''))return;
+ if(e.shiftKey&&(e.key==='D'||e.key==='d'))leakToggle();});
+if(location.search.indexOf('debug=1')>=0&&document.body)leakToggle(true);
 function igName(s){return (s||'').toLowerCase().replace(/^@/,'').replace(/[^a-z0-9._]/g,'');}
 var gstatus='all';
 function filtStatus(el){document.querySelectorAll('.lf').forEach(function(x){x.classList.remove('active');});
@@ -1690,6 +2347,12 @@ function filtStatus(el){document.querySelectorAll('.lf').forEach(function(x){x.c
  if(db)db.style.display=(['alive','private','dead','renamed','unchecked'].indexOf(gstatus)>=0)?'':'none';
  doSearch();}
 function matchFilter(c){var hid=c.getAttribute('data-hidden')==='1';
+ var isMerge=c.getAttribute('data-merge')==='1';
+ var merged=c.getAttribute('data-merged')==='1';
+ if(gstatus==='merges')return isMerge;
+ if(gstatus==='merged')return merged;          /* the absorbed source accounts */
+ if(isMerge)return gstatus==='all';            /* merge tiles live in 'all' (+ 'merges') */
+ if(merged)return false;                        /* members collapsed out of every other view */
  var tr=c.getAttribute('data-track')||'active',st=c.getAttribute('data-status')||'unchecked';
  if(gstatus==='all')return !hid;
  if(gstatus==='hidden')return hid;
@@ -1700,6 +2363,68 @@ function matchFilter(c){var hid=c.getAttribute('data-hidden')==='1';
   return (c.getAttribute('data-lists')||'').split(' ').indexOf(id)>=0;}
  return st===gstatus;}
 function quickCheck(){fetch('/quickcheck',{method:'POST'}).then(function(){setTimeout(livePoll,300);});}
+var HCOLOR={alive:'#3fb950','private':'#d29922',dead:'#f85149',renamed:'#539bf5',error:'#8b949e','no-session':'#8b949e'};
+function validateProfile(p,btn){var card=btn.closest('.card'),old=btn.innerHTML;
+ btn.disabled=true;btn.textContent='⏳ …';
+ fetch('/validate',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
+  body:'profile='+encodeURIComponent(p)}).then(function(r){return r.json();}).then(function(d){
+   btn.disabled=false;btn.innerHTML=old;
+   if(!d.ok){alert('Validate failed: '+(d.note||'unknown'));return;}
+   if(d.new_username){location.reload();return;}   /* rename: refresh handle + aliases everywhere */
+   card.setAttribute('data-status',d.status||'unchecked');
+   var dot=card.querySelector('.dot');
+   if(dot){dot.style.background=HCOLOR[d.status]||'#8b949e';dot.style.boxShadow='none';
+    var t=d.status||'?';if(d.checked_str)t+=' · '+d.checked_str;if(d.note)t+=' · '+d.note;dot.title=t;}
+   if(typeof gstatus!=='undefined'&&gstatus!=='all')doSearch();  /* drop tile if it left the active filter */
+  }).catch(function(){btn.disabled=false;btn.innerHTML=old;alert('Validate request failed.');});}
+var STOGRAM_DB='';   /* remembered source 4K Stogram db path (set per-import, server-persisted) */
+/* Import menu: pick a metadata source to rehydrate this folder from. 4K Stogram
+   is the first source; more can be added as rows here later. */
+function importMenu(p){var dn=escapeHTML(decodeURIComponent(p));
+ openModal('<h3>Import metadata for @'+dn+'</h3>'
+  +'<div class="lrows">'
+  +'<button class="btn" style="text-align:left;width:100%" onclick="import4kStogram(\\''+p+'\\')">'
+  +'⇪ 4K Stogram metadata<br><span class="sub">captions, post URLs, real dates &amp; identity from a .stogram.sqlite</span></button>'
+  +'</div>'
+  +'<div class="sub" style="margin-top:10px">More import sources can be added here.</div>'
+  +'<div class="mbtns"><button class="btn" onclick="closeModal()">cancel</button></div>');}
+function import4kStogram(p){closeModal();var dn=decodeURIComponent(p);
+ var db=prompt('Path to the source 4K Stogram .stogram.sqlite to rehydrate \\''+dn+'\\' from:',STOGRAM_DB||'');
+ if(db===null)return; db=db.trim(); if(!db){alert('No path given.');return;} STOGRAM_DB=db;
+ fetch('/import',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
+  body:'profile='+encodeURIComponent(p)+'&db='+encodeURIComponent(db)})
+  .then(function(r){return r.json();}).then(function(d){
+   if(!d.ok){alert('Import failed: '+(d.note||'unknown'));return;}
+   alert('Imported '+dn+':\\n'+d.matched+' of '+d.disk_files+' on-disk files matched '
+    +'('+d.db_rows+' rows in db)\\nidentity: @'+d.ownerName+' · id '+d.ownerId
+    +(d.private?' · private':'')+'\\n\\nReloading to show captions & corrected dates.');
+   location.reload();
+  }).catch(function(){alert('Import request failed.');});}
+function importAllCtl(a){fetch('/import-all',{method:'POST',
+ headers:{'Content-Type':'application/x-www-form-urlencoded'},
+ body:'action='+encodeURIComponent(a)}).then(function(){setTimeout(livePoll,300);});}
+function importAll(){
+ var db=prompt('Rehydrate ALL matching folders from this 4K Stogram .stogram.sqlite:\\n\\n(Idempotent — safe to re-run; only folders with a matching profile in the db are touched.)',STOGRAM_DB||'');
+ if(db===null)return; db=db.trim(); if(!db){alert('No path given.');return;} STOGRAM_DB=db;
+ fetch('/import-all',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
+  body:'db='+encodeURIComponent(db)}).then(function(r){return r.json();}).then(function(d){
+   if(!d.ok){alert('Import-all failed: '+(d.note||'unknown'));return;}
+   livePoll();   /* show the progress banner */
+   var seen=false,n=0;
+   var t=setInterval(function(){n++;
+    fetch('/status').then(function(r){return r.json();}).then(function(s){
+     var im=(s&&s['import'])||{};
+     if(im.running){seen=true;return;}
+     if(!seen&&n<3)return;        /* wait for the sweep to actually start */
+     clearInterval(t);
+     alert('Import all complete'+(im.stop?' (stopped early)':'')+':\\n\\n'
+      +'+ '+(im.imported||0)+' folders imported\\n'
+      +(im.skipped||0)+' skipped (no match in db)\\n'
+      +(im.files||0)+' on-disk files matched a db row.\\n\\nReloading.');
+     location.reload();
+    }).catch(function(){});
+   },2000);
+  }).catch(function(){alert('Import-all request failed.');});}
 function deepCheck(){if(gstatus==='all'){alert('Pick a status filter first (e.g. dead).');return;}
  if(!confirm('Deep-check the \\''+gstatus+'\\' accounts with the authenticated API? Burns IG calls only on that bucket.'))return;
  fetch('/heartbeat',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
@@ -1796,6 +2521,57 @@ function assignSelected(){var name=(document.getElementById('sellist').value||''
  var folders=[];document.querySelectorAll('.card .sel:checked').forEach(c=>{var card=c.closest('.card');if(card)folders.push(decodeURIComponent(card.getAttribute('data-folder')));});
  if(!folders.length){alert('Select some accounts first.');return;}
  postLists({action:'assign',name:name,folders:JSON.stringify(folders)});}
+/* ---- Merge: squash several profiles into one combined timeline ---- */
+function mergeSelected(){
+ var folders=[];document.querySelectorAll('.card .sel:checked').forEach(function(c){
+  var card=c.closest('.card');
+  if(card&&card.getAttribute('data-merge')!=='1')folders.push(decodeURIComponent(card.getAttribute('data-folder')));});
+ if(folders.length<2){alert('Select at least two profiles to merge.');return;}
+ window.__mergeFolders=folders;
+ var opts=folders.map(function(f){return '<option value="'+escapeAttr(f)+'">'+escapeHTML(f)+'</option>';}).join('');
+ openModal('<h3>Merge '+folders.length+' profiles</h3>'
+  +'<div class="sub" style="margin-bottom:10px">'+folders.map(escapeHTML).join(', ')+'</div>'
+  +'<label class="lrow"><input type="radio" name="mmode" value="new" checked onchange="mmodeUI()"> New merged profile</label>'
+  +'<div class="newrow" id="mnewrow"><input id="mnewname" placeholder="merged profile name…"></div>'
+  +'<label class="lrow"><input type="radio" name="mmode" value="parent" onchange="mmodeUI()"> Merge into a parent (uses its name &amp; cover)</label>'
+  +'<div class="newrow" id="mparrow" style="display:none"><select id="mparent">'+opts+'</select></div>'
+  +'<div class="mbtns"><button class="btn go" onclick="previewMerge()">👁 preview</button>'
+  +'<button class="btn" onclick="closeModal()">cancel</button></div>');}
+function mmodeUI(){var p=document.querySelector('input[name=mmode]:checked').value;
+ document.getElementById('mnewrow').style.display=p==='new'?'':'none';
+ document.getElementById('mparrow').style.display=p==='parent'?'':'none';}
+function previewMerge(){var mode=document.querySelector('input[name=mmode]:checked').value;
+ var folders=window.__mergeFolders||[],name='',primary='';
+ if(mode==='new'){name=(document.getElementById('mnewname').value||'').trim();
+  if(!name){alert('Type a name for the merged profile.');return;}}
+ else{primary=document.getElementById('mparent').value;}
+ location.href='/m/preview?name='+encodeURIComponent(name)
+  +'&primary='+encodeURIComponent(primary)
+  +'&members='+encodeURIComponent(JSON.stringify(folders));}
+function commitMerge(){var p=window.__preview;if(!p)return;
+ fetch('/merge',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
+  body:'action=create&name='+encodeURIComponent(p.name||'')+'&primary='+encodeURIComponent(p.primary||'')
+   +'&members='+encodeURIComponent(JSON.stringify(p.members||[]))})
+  .then(function(r){return r.json();}).then(function(d){
+   if(d.ok){location.href='/m/'+encodeURIComponent(d.id);}else{alert('Merge failed: '+(d.note||'unknown'));}});}
+function unmerge(mid){if(!confirm('Un-merge this group? The source profiles return to the grid; no files are touched.'))return;
+ fetch('/merge',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
+  body:'action=delete&id='+encodeURIComponent(mid)}).then(function(){location.href='/';});}
+function renameMerge(mid){var v=prompt('Rename merged profile:');if(v===null||!v.trim())return;
+ fetch('/merge',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
+  body:'action=rename&id='+encodeURIComponent(mid)+'&name='+encodeURIComponent(v.trim())}).then(function(){location.reload();});}
+function buildDedupe(mid){
+ fetch('/dedupe-build',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
+  body:'id='+encodeURIComponent(mid)}).then(function(r){return r.json();}).then(function(d){
+   if(!d.ok){alert('Could not start hashing: '+(d.note||'unknown'));return;}
+   alert('Hashing images in the background — this can take a while for a large merge. '
+    +'The page will reload into the deduped view when it finishes.');
+   var t=setInterval(function(){
+    fetch('/status').then(function(r){return r.json();}).then(function(s){
+     if((s&&s.phash&&s.phash.running))return;
+     clearInterval(t);location.href='/m/'+encodeURIComponent(mid)+'?dedupe=1';
+    }).catch(function(){});
+   },2500);});}
 document.addEventListener('keydown',e=>{if(e.key==='Escape'){var m=document.getElementById('modal');if(m&&m.style.display==='flex')closeModal();}});
 /* ---- Backup & restore ---- */
 function openBackup(){fetch('/backups').then(r=>r.json()).then(d=>{
@@ -1827,6 +2603,7 @@ def page(title, body, extra_js=""):
             "<meta name='viewport' content='width=device-width,initial-scale=1'>"
             "<title>%s</title><style>%s</style></head><body>%s"
             "<div id='lb'><span class='close' onclick='closeLB()'>×</span>"
+            "<span class='mute' id='mute' onclick='toggleMute()'></span>"
             "<span class='nav l' onclick='step(-1)'>‹</span>"
             "<span class='nav r' onclick='step(1)'>›</span>"
             "<div class='stage'></div><div class='cap' id='cap'></div></div>"
@@ -1888,6 +2665,13 @@ def discover_panel():
                 "its existing files, and registers its identity.%s</div>"
                 % (len(new), "" if len(new) == 1 else "s", rows))
     if DISMISSED:
+        # drop ignored markers whose folder has since vanished from disk
+        live = {d for d in DISMISSED if (ROOT / d).is_dir()}
+        if live != DISMISSED:
+            DISMISSED.clear()
+            DISMISSED.update(live)
+            save_dismissed()
+    if DISMISSED:
         ig = " · ".join(
             "%s <a href='#' onclick=\"adopt('%s','readd');return false\">re-add</a>"
             % (html.escape(n), urllib.parse.quote(n)) for n in sorted(DISMISSED))
@@ -1920,6 +2704,29 @@ def quick_check_banner():
             % (QUICK["done"], QUICK["total"], pct))
 
 
+def phash_banner():
+    if not PHASHJOB["running"]:
+        return ""
+    pct = int(100 * PHASHJOB["done"] / PHASHJOB["total"]) if PHASHJOB["total"] else 0
+    return ("<div class='banner'>⧉ Hashing images for dedupe — %d/%d (%d%%) · "
+            "<button class='btn' onclick=\"fetch('/dedupe-build',{method:'POST',"
+            "headers:{'Content-Type':'application/x-www-form-urlencoded'},"
+            "body:'action=stop'})\">■ stop</button></div>"
+            % (PHASHJOB["done"], PHASHJOB["total"], pct))
+
+
+def import_banner():
+    if not IMPORT["running"]:
+        return ""
+    pct = int(100 * IMPORT["done"] / IMPORT["total"]) if IMPORT["total"] else 0
+    cur = (" · now <b>%s</b>" % html.escape(IMPORT["current"])) if IMPORT["current"] else ""
+    return ("<div class='banner'>⇪ Importing 4K Stogram metadata — %d/%d (%d%%) · "
+            "%d matched, %d skipped%s &nbsp; "
+            "<button class='btn' onclick=\"importAllCtl('stop')\">■ stop</button></div>"
+            % (IMPORT["done"], IMPORT["total"], pct, IMPORT["imported"],
+               IMPORT["skipped"], cur))
+
+
 HEALTH_COLOR = {"alive": "#3fb950", "private": "#d29922", "dead": "#f85149",
                 "renamed": "#539bf5", "error": "#8b949e", "no-session": "#8b949e"}
 
@@ -1946,6 +2753,7 @@ def render_index():
                 "<div class='wrap'><div id='banners'>%s</div></div>" % scan_banner())
         return page("indexing…", body)
     lnames = list_names()
+    mm = merged_members()
     cards = []
     for name, rec in profiles:
         pe = urllib.parse.quote(name)
@@ -1966,6 +2774,8 @@ def render_index():
                      "(was %s)</span>" % html.escape(name))
         hid = is_hidden_profile(name)
         arch = is_archived(name)
+        merged = name in mm
+        midof = merge_of(name) if merged else None
         lidx = " ".join(str(i) for i, L in enumerate(lnames) if name in LISTS[L])
         # build each button fully-formed (pe may contain '%' from quoting; never
         # let a pre-substituted fragment become part of a later % format string)
@@ -1973,6 +2783,11 @@ def render_index():
                  % pe)
         rmb = ("<button class='btn' onclick=\"removeProfile('%s')\" "
                "title='Remove from offgram (keep files)'>✕</button>" % pe)
+        valb = ("<button class='btn' onclick=\"validateProfile('%s',this)\" "
+                "title='Check liveness + name history'>✓ validate</button>" % pe)
+        impb = ("<button class='btn' onclick=\"importMenu('%s')\" "
+                "title='Import metadata for this folder (4K Stogram, …)'>"
+                "⇪ import…</button>" % pe)
         if hid:
             actions = (("<button class='btn' onclick=\"restoreProfile('%s')\">↶ restore"
                         "</button>" % pe)
@@ -1982,17 +2797,22 @@ def render_index():
             tag = "<span class='tag'>removed</span>"
         elif arch:
             actions = (("<button class='btn' onclick=\"setTrack('%s','active')\" "
-                        "title='Resume updates'>▶ track</button>" % pe) + listb + rmb)
+                        "title='Resume updates'>▶ track</button>" % pe)
+                       + valb + impb + listb + rmb)
             tag = "<span class='tag'>archive-only</span>"
         else:
             actions = (("<button class='btn' onclick=\"upd('%s')\">↻ update</button>" % pe)
+                       + valb + impb
                        + ("<button class='btn' onclick=\"setTrack('%s','archive')\" "
                           "title='View-only: stop updating'>⊘ archive</button>" % pe)
                        + listb + rmb)
             tag = ""
+        if merged:
+            tag += ("<a class='tag' href='/m/%s' title='Part of a merge'>⤳ merged</a>"
+                    % urllib.parse.quote(midof))
         cards.append(
             "<div class='card' data-name='%s' data-folder='%s' data-status='%s' "
-            "data-track='%s' data-hidden='%s' data-lists='%s'>"
+            "data-track='%s' data-hidden='%s' data-lists='%s' data-merged='%s'>"
             "<input type='checkbox' class='sel' onclick='selChanged()'>"
             "<a class='thumb' href='/p/%s'>%s"
             "<span class='badge'>%d</span></a><div class='meta'>"
@@ -2001,8 +2821,33 @@ def render_index():
             % (html.escape(searchkey), pe,
                ((HEALTH.get(name) or {}).get("status") or "unchecked"),
                "archive" if arch else "active", "1" if hid else "0", lidx,
+               "1" if merged else "0",
                pe, img, rec["total"], health_dot(HEALTH.get(name)),
                disp, html.escape(bits or "empty"), tag, actions))
+    merge_cards = []
+    for mid, m in sorted(MERGES.items(),
+                         key=lambda kv: (kv[1].get("name") or kv[0]).lower()):
+        members = [f for f in m.get("members", []) if f in INDEX["profiles"]]
+        if not members:
+            continue
+        me = urllib.parse.quote(mid)
+        f, cov = merge_cover(m)
+        img = ("<img loading='lazy' src='/thumb?p=%s'>"
+               % urllib.parse.quote("%s/%s" % (f, cov)) if cov
+               else "<div class='play'>▦</div>")
+        nm = m.get("name") or mid
+        skey = (nm + " " + " ".join(members)).lower()
+        actions = (("<a class='btn go' href='/m/%s'>↗ open</a>" % me)
+                   + ("<button class='btn' onclick=\"renameMerge('%s')\">✎ rename</button>" % me)
+                   + ("<button class='btn' onclick=\"unmerge('%s')\">✕ unmerge</button>" % me))
+        merge_cards.append(
+            "<div class='card mergecard' data-name='%s' data-merge='1'>"
+            "<a class='thumb' href='/m/%s'>%s<span class='badge'>%d</span></a>"
+            "<div class='meta'><b>⤳ %s</b><div class='s2'>%d accounts</div>"
+            "<div class='actions'>%s</div></div></div>"
+            % (html.escape(skey), me, img, merge_total(m),
+               html.escape(nm), len(members), actions))
+    cards = merge_cards + cards
     built = time.strftime("%Y-%m-%d %H:%M", time.localtime(INDEX.get("built", 0)))
     stcounts = {}
     for n, _ in profiles:
@@ -2045,6 +2890,8 @@ def render_index():
               + lf("tracked", "↻ tracked", "", n_tracked)
               + lf("archive", "⊘ archive", "", n_archive)
               + lf("hidden", "✕ hidden", "", n_hidden)
+              + (lf("merges", "⤳ merges", "", len(MERGES)) if MERGES else "")
+              + (lf("merged", "⤳ merged-in", "", len(mm)) if mm else "")
               + listchips
               + "<button class='btn' id='deepbtn' style='display:none' "
               "onclick='deepCheck()'>🔬 deep-check filtered (authenticated)</button>"
@@ -2069,6 +2916,9 @@ def render_index():
             "<button class='btn' onclick='quickCheck()'>⚡ Quick check</button>"
             "<button class='btn' onclick='heartbeat()'>♥ Check all</button>"
             "<button class='btn' onclick='rescan()'>⟳ rescan</button>"
+            "<button class='btn' onclick='importAll()' "
+            "title='Idempotently rehydrate every folder that matches a 4K Stogram db'>"
+            "⇪ import all</button>"
             "<button class='btn go' onclick='refreshAll()'>⟲ Refresh all</button>"
             "<button class='btn' onclick='openManage()'>🗂 lists</button>"
             "<button class='btn' onclick='toggleSelect()'>▦ select</button>"
@@ -2078,13 +2928,15 @@ def render_index():
             "<div id='selbar'><b id='selcount'>0 selected</b>"
             "<input id='sellist' list='alllists' placeholder='list name…'>"
             "<button class='btn go' onclick='assignSelected()'>assign → list</button>"
+            "<button class='btn go' onclick='mergeSelected()'>⤳ merge…</button>"
             "<button class='btn' onclick='clearSel()'>clear</button>"
             "<datalist id='alllists'></datalist></div>"
             "<div id='banners'>%s%s</div>%s<div class='grid'>%s</div></div>"
             % (n_tracked + n_archive, built, acct, legend, scan_banner(),
                refresh_banner(), discover_panel(), "".join(cards)))
     return page("offgram", body,
-                "window.ALL_LISTS=%s;initLists();" % json.dumps(lnames))
+                "window.ALL_LISTS=%s;STOGRAM_DB=%s;initLists();"
+                % (json.dumps(lnames), json.dumps(stogram_source_db() or "")))
 
 
 def render_profile(profile):
@@ -2134,6 +2986,120 @@ def render_profile(profile):
     return page(profile, body, js)
 
 
+def _merge_page(m, mid=None, dedupe=False, threshold=14, cap=12):
+    """Render a merge's combined omnibus timeline. mid=None means a PREVIEW of an
+    uncommitted merge (members passed ad-hoc). dedupe=True collapses near-identical
+    images/videos (pHash within `threshold` bits, runaway chains over `cap` left
+    intact) into one cell carrying every copy's metadata."""
+    preview = mid is None
+    coverage, oversized = 1.0, 0
+    if dedupe and not preview:
+        items, coverage, oversized = merge_items_deduped(m, threshold, cap)
+    else:
+        items = merge_items(m)
+    data = [{"rel": it["rel"], "kind": it["kind"], "caption": it["caption"],
+             "url": it["url"], "ts": it["ts"], "section": it["section"],
+             "sc": it["sc"], "src": it.get("src", ""),
+             "n": it.get("n", 1), "dups": it.get("dups", [])} for it in items]
+    members = m.get("members", [])
+    chips = " ".join(
+        "<a class='mchip' href='/p/%s'>%s%s</a>"
+        % (urllib.parse.quote(f), html.escape(identity_handle(f)),
+           " ★" if f == m.get("primary") else "")
+        for f in members)
+    name = m.get("name") or mid or "preview"
+    src_btn = ("<button class='btn' onclick='toggleSrc()' id='srcbtn' "
+               "title='Show/hide which account each post came from'>🏷 sources</button>")
+    if preview:
+        ctrl = (src_btn
+                + "<button class='btn go' onclick='commitMerge()'>✓ commit merge</button>"
+                "<button class='btn' onclick=\"location.href='/'\">✕ cancel</button>")
+        banner = ("<div class='banner'>👁 <b>Preview — not saved.</b> This is how the "
+                  "%d posts from %d accounts will combine into one timeline. Review, "
+                  "then commit or cancel.</div>" % (len(items), len(members)))
+    else:
+        me = urllib.parse.quote(mid)
+        dbtn = (("<button class='btn go' onclick=\"location.href='/m/%s?dedupe=0'\">▦ show all</button>" % me)
+                if dedupe else
+                ("<button class='btn' onclick=\"location.href='/m/%s'\">⧉ dedupe</button>" % me))
+        ctrl = (src_btn + dbtn
+                + "<button class='btn' onclick=\"unmerge('%s')\">✕ unmerge</button>" % me)
+        if dedupe:
+            raw = merge_total(m)
+            removed = max(raw - len(items), 0)
+            tighter = max(threshold - 2, 0)
+            looser = min(threshold + 2, 24)
+            tune = (" &nbsp; match tolerance <b>%d</b> "
+                    "<a href='/m/%s?dedupe=1&d=%d'>− tighter</a> · "
+                    "<a href='/m/%s?dedupe=1&d=%d'>looser +</a>"
+                    % (threshold, me, tighter, me, looser))
+            guard = ("" if not oversized else
+                     " &nbsp; · %d look-alike group%s left intact (size guard)"
+                     % (oversized, "" if oversized == 1 else "s"))
+            note = ""
+            if coverage < 0.999:
+                note = (" &nbsp; · only %d%% hashed — <a href='#' onclick=\"buildDedupe('%s');"
+                        "return false\">build full dedupe index</a>"
+                        % (int(coverage * 100), me))
+            banner = ("<div class='banner'>⧉ <b>Deduped</b> — showing %d of %d posts "
+                      "(%d duplicate%s collapsed).%s%s%s</div>"
+                      % (len(items), raw, removed, "" if removed == 1 else "s",
+                         tune, guard, note))
+        else:
+            banner = ("<div class='banner'>▦ Showing all %d posts (raw). "
+                      "<a href='/m/%s'>⧉ switch to deduped</a></div>"
+                      % (len(items), me))
+    body = ("<header><a href='/' class='btn'>‹ all</a><h1>⤳ %s</h1>"
+            "<span class='sub'>%d items · %d accounts</span><span class='sp'></span>"
+            "%s</header>"
+            "<div class='wrap'>%s<div class='mchips'>merged: %s</div>"
+            "<div class='mediagrid' id='mg'></div>"
+            "<div id='sentinel' style='height:1px'></div></div>"
+            % (html.escape(name), len(items), len(members), ctrl, banner, chips))
+    preview_js = ("window.__preview=%s;\n"
+                  % json.dumps({"name": name, "members": members,
+                                "primary": m.get("primary")})) if preview else ""
+    # Same windowed grid as a profile, plus a source badge and a ×N dup badge.
+    js = (preview_js + "ITEMS=%s;\n"
+          "var BATCH=150,shown=0,gfilter='all',_idxs=[];\n"
+          "function cellHTML(it,i){var p=it.kind==='video'?\"<div class='play'>\\u25b6</div>\":'';\n"
+          " var sb=it.src?\"<span class='srctag'>@\"+escapeHTML(it.src)+\"</span>\":'';\n"
+          " var nb=it.n>1?\"<span class='dupbadge'>\\u00d7\"+it.n+\"</span>\":'';\n"
+          " return \"<div class='cell' data-sec='\"+it.section+\"' onclick='openLB(\"+i+\")'>\"+\n"
+          "  \"<img loading='lazy' src='/thumb?p=\"+encodeURIComponent(it.rel)+\"'>\"+p+sb+nb+\"</div>\";}\n"
+          "function _vis(){var o=[];for(var i=0;i<ITEMS.length;i++){"
+          "if(gfilter==='all'||ITEMS[i].section===gfilter)o.push(i);}return o;}\n"
+          "function renderMore(){var mg=document.getElementById('mg');"
+          "var end=Math.min(shown+BATCH,_idxs.length),h='';"
+          "for(var k=shown;k<end;k++){var i=_idxs[k];h+=cellHTML(ITEMS[i],i);}"
+          "mg.insertAdjacentHTML('beforeend',h);shown=end;"
+          "document.getElementById('sentinel').style.display=shown<_idxs.length?'':'none';}\n"
+          "function resetGrid(){document.getElementById('mg').innerHTML='';shown=0;"
+          "_idxs=_vis();renderMore();}\n"
+          "function toggleSrc(){document.body.classList.toggle('hidesrc');}\n"
+          "new IntersectionObserver(function(es){es.forEach(function(e){"
+          "if(e.isIntersecting)renderMore();});},{rootMargin:'1000px'})"
+          ".observe(document.getElementById('sentinel'));\n"
+          "resetGrid();"
+          % json.dumps(data))
+    return page(name, body, js)
+
+
+def render_merge(mid, dedupe=False, threshold=14, cap=12):
+    m = MERGES.get(mid)
+    return _merge_page(m, mid, dedupe, threshold, cap) if m else None
+
+
+def render_merge_preview(name, members, primary):
+    members = [f for f in members if f in INDEX["profiles"]]
+    if len(members) < 2:
+        return None
+    m = {"name": name or (identity_handle(primary) if primary in members
+                          else members[0]),
+         "members": members, "primary": primary if primary in members else None}
+    return _merge_page(m, mid=None)
+
+
 # ---------------------------------------------------------------------------
 # HTTP server
 # ---------------------------------------------------------------------------
@@ -2169,6 +3135,28 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path.startswith("/p/"):
             b = render_profile(urllib.parse.unquote(path[3:]))
             return self._send(200, b) if b else self._send(404, b"no such profile")
+        if path == "/m/preview":
+            try:
+                members = json.loads(qs.get("members", ["[]"])[0])
+            except Exception:                         # noqa: BLE001
+                members = []
+            b = render_merge_preview(qs.get("name", [""])[0], members,
+                                     qs.get("primary", [""])[0] or None)
+            return self._send(200, b) if b else self._send(
+                400, b"need 2+ valid profiles to preview")
+        if path.startswith("/m/"):
+            try:
+                thr = max(0, min(int(qs.get("d", ["14"])[0]), 24))
+            except ValueError:
+                thr = 14
+            try:
+                cap = max(0, min(int(qs.get("cap", ["12"])[0]), 1000))
+            except ValueError:
+                cap = 12
+            b = render_merge(urllib.parse.unquote(path[3:]),
+                             dedupe=qs.get("dedupe", ["1"])[0] != "0",
+                             threshold=thr, cap=cap)
+            return self._send(200, b) if b else self._send(404, b"no such merge")
         if path == "/thumb":
             return self.serve_thumb(qs.get("p", [""])[0])
         if path == "/media":
@@ -2179,9 +3167,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                               "application/json")
         if path == "/banners":
             payload = {"html": (scan_banner() + quick_check_banner()
+                                + import_banner() + phash_banner()
                                 + heartbeat_banner() + refresh_banner()),
                        "active": (SCAN["running"] or REFRESH["running"]
-                                  or HEARTBEAT["running"] or QUICK["running"])}
+                                  or HEARTBEAT["running"] or QUICK["running"]
+                                  or IMPORT["running"] or PHASHJOB["running"])}
             return self._send(200, json.dumps(payload).encode(), "application/json")
         if path == "/status":
             with JOBS_LOCK:
@@ -2189,9 +3179,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 jobs_payload = {k: {"running": v["running"], "log": v["log"][-20:]}
                                 for k, v in JOBS.items()}
             payload = {"any": (jobs_running or SCAN["running"] or REFRESH["running"]
-                               or HEARTBEAT["running"]),
+                               or HEARTBEAT["running"] or IMPORT["running"]),
                        "scan": dict(SCAN), "prewarm": dict(PREWARM),
                        "heartbeat": dict(HEARTBEAT), "refresh": refresh_snapshot(),
+                       "import": dict(IMPORT), "phash": dict(PHASHJOB),
                        "jobs": jobs_payload}
             return self._send(200, json.dumps(payload).encode(), "application/json")
         if path == "/backups":
@@ -2253,6 +3244,106 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if u.path == "/quickcheck":
             start_quickcheck()
             return self._send(200, b'{"ok":true}', "application/json")
+        if u.path == "/validate":
+            # One-off per-tile check: liveness + name-history for a single folder.
+            # Uses the authenticated check (detects renames via the stable userid
+            # baked into 4K Stogram filenames); falls back to the anonymous quick
+            # check when there's no session, so the button still reports liveness.
+            p = form.get("profile", [""])[0]
+            if p not in INDEX["profiles"]:
+                return self._send(404, b'{"ok":false,"note":"unknown profile"}',
+                                  "application/json")
+            res = check_one(p)
+            if res.get("status") == "no-session":
+                res = quick_check_one(p)
+                res["note"] = "no IG session — liveness only (log in for name-history)"
+            HEALTH[p] = res
+            if res.get("userid"):
+                update_identity(p, userid=res["userid"],
+                                username=res.get("new_username") or p)
+            save_health()
+            out = {"ok": True, "status": res.get("status"),
+                   "new_username": res.get("new_username"),
+                   "handle": identity_handle(p),
+                   "checked_str": time.strftime(
+                       "%Y-%m-%d", time.localtime(res.get("checked", 0))),
+                   "note": res.get("note")}
+            return self._send(200, json.dumps(out).encode("utf-8"),
+                              "application/json")
+        if u.path == "/import":
+            # Rehydrate one folder from a source 4K Stogram db. The path is
+            # user-pointable: a 'db' form field overrides (and is remembered as)
+            # the source; otherwise the last-remembered / configured source is used.
+            p = form.get("profile", [""])[0]
+            db = form.get("db", [""])[0].strip()
+            if db:
+                save_stogram_source(db)
+            else:
+                db = stogram_source_db()
+            if not db:
+                return self._send(
+                    400, b'{"ok":false,"note":"no source db set \\u2014 give a path"}',
+                    "application/json")
+            res = import_from_stogram(p, db)
+            return self._send(200 if res.get("ok") else 400,
+                              json.dumps(res).encode("utf-8"), "application/json")
+        if u.path == "/import-all":
+            # Idempotent sweep: rehydrate every indexed folder that matches a
+            # subscription in the source db. 'action=stop' aborts a running sweep.
+            if form.get("action", [""])[0] == "stop":
+                IMPORT["stop"] = True
+                return self._send(200, b'{"ok":true}', "application/json")
+            db = form.get("db", [""])[0].strip()
+            if db:
+                save_stogram_source(db)
+            else:
+                db = stogram_source_db()
+            if not db:
+                return self._send(
+                    400, b'{"ok":false,"note":"no source db set \\u2014 give a path"}',
+                    "application/json")
+            ok = start_import_all(db)
+            return self._send(200 if ok else 409,
+                              b'{"ok":true}' if ok else
+                              b'{"ok":false,"note":"import already running"}',
+                              "application/json")
+        if u.path == "/merge":
+            action = form.get("action", ["create"])[0]
+            if action == "delete":
+                ok = delete_merge(form.get("id", [""])[0])
+                return self._send(200 if ok else 404,
+                                  b'{"ok":true}' if ok else b'{"ok":false}',
+                                  "application/json")
+            if action == "rename":
+                ok = rename_merge(form.get("id", [""])[0], form.get("name", [""])[0])
+                return self._send(200 if ok else 400,
+                                  b'{"ok":true}' if ok else b'{"ok":false}',
+                                  "application/json")
+            # create
+            try:
+                members = json.loads(form.get("members", ["[]"])[0])
+            except Exception:                         # noqa: BLE001
+                members = []
+            primary = form.get("primary", [""])[0] or None
+            mid = create_merge(form.get("name", [""])[0], members, primary)
+            if not mid:
+                return self._send(
+                    400, b'{"ok":false,"note":"need 2+ valid profiles"}',
+                    "application/json")
+            return self._send(200, json.dumps({"ok": True, "id": mid}).encode(),
+                              "application/json")
+        if u.path == "/dedupe-build":
+            if form.get("action", [""])[0] == "stop":
+                PHASHJOB["stop"] = True
+                return self._send(200, b'{"ok":true}', "application/json")
+            mid = form.get("id", [""])[0]
+            if mid not in MERGES:
+                return self._send(404, b'{"ok":false}', "application/json")
+            ok = start_phash_job(mid)
+            return self._send(200 if ok else 409,
+                              b'{"ok":true}' if ok else
+                              b'{"ok":false,"note":"hashing already running"}',
+                              "application/json")
         if u.path == "/add":
             p = form.get("profile", [""])[0].strip().lstrip("@").lower()
             if p and re.match(r"^[a-z0-9._]{1,40}$", p):
@@ -2446,10 +3537,13 @@ def main():
     load_hb_progress()
     load_identity()
     sync_identity_from_health()      # seed registry from any known user-ids / renames
+    load_folder_sidecars()           # rehydrated captions/identity from prior imports
     load_tracking()
     load_hidden()
     load_dismissed()
     load_lists()
+    load_merges()
+    load_phash()
     load_refresh()
     have_cache = load_index()
     pending = [p for p in load_scan_pending() if (ROOT / p).is_dir()]
