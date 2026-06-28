@@ -2,48 +2,66 @@
 
 **An offline web gallery for your instaloader archive.**
 
-[instaloader](https://github.com/instaloader/instaloader) downloads Instagram posts, reels, stories, and highlights to disk. offgram is the other half: it turns that pile of dated files into a fast, browsable local gallery — per profile, with captions, in-browser video, and original-post links — and gives you buttons to pull updates, add new profiles, and check account health. It's for archivists who already have an instaloader collection and want to actually *look* at it (and keep it current).
+[instaloader](https://github.com/instaloader/instaloader) downloads Instagram posts, reels, stories, and highlights to disk. offgram is the other half: it turns that pile of dated files into a fast, browsable local gallery — per profile, with captions, in-browser video, and original-post links — and gives you buttons to pull updates, add new profiles, check account health, rehydrate old metadata, and **merge an author's scattered accounts into one de-duplicated timeline**. It's for archivists who already have a collection and want to actually *look* at it (and keep it current).
 
 It's a single dependency-free Python file (standard library only). The archive can live anywhere — local disk or a network share — and offgram scans it **once** into a local cache, so the UI stays instant.
+
+> **Non-destructive by design.** offgram never writes to your archive. Everything it adds — health, identity/renames, lists, merges, rehydrated captions, dedup hashes — lives in its own cache as overlays. The only thing that ever writes media is instaloader, via the update buttons. If offgram vanished tomorrow, your folders would be untouched and browsable in Finder.
 
 ## Features
 
 **Browse**
 - By profile, with **posts / reels / stories / highlights / tagged** section tabs
 - Lightbox with keyboard navigation and **in-browser video scrubbing** (HTTP Range)
-- **Captions + original-post links** from instaloader's `.txt` / `.json.xz` sidecars
-- **Search box** filters your profiles live as you type
+- **Mute toggle** on videos — they start muted (so autoplay is reliable); 🔇/🔊 flips sound and remembers your choice
+- **Captions + original-post links** from instaloader's `.txt` / `.json.xz` sidecars (or a 4K Stogram db — see *Rehydrate*)
+- **Search box** filters your profiles live as you type (matches handles, folder names, and known aliases)
 - Huge profiles stay snappy — grids render in batches as you scroll (windowed)
 
 **Update**
-- Per-profile **↻ update** and **↻ Update all** buttons run instaloader, with live progress in a collapsible **▤ log** panel; updates are **incremental** (`--latest-stamps`), never full re-downloads
-- **Ephemeral capture** — updates also pull **stories, highlights, and reels** in separate instaloader passes, each routed into its own section subfolder so the tabs populate (reels also arrive in-feed with posts)
-- **Add a new profile** — type an un-archived `@name` in the search box and hit **Archive @name**; instaloader downloads it and it joins the grid
-- **⟲ Refresh all** runs a slow, resumable, throttle-aware whole-archive refresh in the background (a profile every few minutes, pausable, resumes after a restart); skips dead and archive-only accounts
+- Per-profile **↻ update** and **↻ Update all** run instaloader, with live progress in a collapsible **▤ log**; updates are **incremental** (`--latest-stamps`), never full re-downloads
+- **Ephemeral capture** — updates also pull **stories, highlights, and reels** in separate passes, each routed into its own section subfolder
+- **Add a new profile** — type an un-archived `@name` in the search box and hit **Archive @name**
+- **⟲ Refresh all** runs a slow, resumable, throttle-aware whole-archive refresh in the background; skips dead and archive-only accounts
 
-**Accounts**
-- An **"as @account"** switcher in the header lists your saved instaloader sessions; the active account is used for both updates and the heartbeat, and the choice persists across restarts
+**Health & validation**
+- **⚡ Quick check** — anonymous, login-free liveness triage across all profiles (cheap reachability, fired in parallel)
+- **♥ Check all** — authenticated heartbeat via your session; marks every profile with a colored dot: 🟢 alive · 🟡 private · 🔴 dead · 🔵 renamed (hover for the new handle) · ⚪ not checked. Rename detection uses the account's numeric user-id (parsed from filenames), so it survives username changes
+- **✓ validate** (per-tile) — a one-click liveness **+ name-history** check for a single folder. Ideal for confirming a folder name from an old backup is still a live handle: it resolves the stable user-id and reports a rename even when the handle no longer exists. Falls back to anonymous liveness when you're not logged in
 
-**Status (heartbeat)**
-- **♥ Check all** pings Instagram via your session and marks every profile with a colored dot: 🟢 alive · 🟡 private · 🔴 dead · 🔵 renamed (hover for the new handle) · ⚪ not checked. A legend sits in the header. Throttled and on-demand only; rename detection uses the account's numeric user-id (parsed from filenames), so it survives username changes
+**Merge accounts into one timeline**
+- **▦ select** several profiles from the same creator (an abandoned one, a revived one, a banned one…) and **⤳ merge…** them
+- Name a **new merged profile**, or designate a **parent** (its handle and cover lead)
+- **👁 Preview** the combined timeline *before committing* — nothing is saved until you confirm
+- The **omnibus view** stitches every member's posts into one contiguous, time-sorted timeline, each post badged with its source account (🏷 toggle)
+- **Near-duplicate dedup** — the same photo re-uploaded across accounts (Instagram re-encodes it each time, so files differ) is detected by **perceptual hash** and collapsed to a single cell carrying *every* copy's caption/date/account. Always keeps at least the best-quality copy
+  - Tunable **match tolerance** (− tighter / looser +) per view
+  - A **size guard** leaves runaway look-alike groups un-collapsed (errs toward never falsely merging)
+- Fully **non-destructive and reversible** — a merge is a saved grouping plus a live view; **✕ unmerge** restores the source profiles instantly. No files move.
+
+**Rehydrate from a 4K Stogram database**
+- Migrating folders out of an old [4K Stogram](https://www.4kdownload.com/products/stogram) archive? Their captions, post URLs, real timestamps, and identity live in that archive's `.stogram.sqlite`, not in the folders themselves.
+- **⇪ import…** (per-tile) pulls one folder's metadata from a source db you point at; **⇪ import all** sweeps every folder in one pass. **Idempotent** — safe to re-run as you add more folders or point at a newer db.
+- Reads the source db **read-only**; writes only a per-folder `.offgram-stogram.json` sidecar in your collection. Never touches the source archive or any media file.
 
 **Organize**
-- **Tracking modes** per profile: *active* (default), **⊘ archive (view-only)** — fully browsable but skipped by Update all / Refresh all, for accounts you keep but no longer pull — and **✕ removed** (dropped from the grid, files kept, reachable under the **hidden** filter to restore). A removed profile can be **🗑 deleted from disk** behind a type-the-name confirm when you truly want it gone
-- **Lists** — user-named groups (tags); an account can be on several at once. Create/rename/delete via **🗂 lists**, add one account from its per-card **🗂**, or **▦ select** several and bulk-assign. Each list becomes a filter chip
-- **Discovery** — folders that show up on disk but aren't tracked (added straight via instaloader, copied in) are flagged in a **🆕 new folders** banner; adopt one to deep-scan it, seed incremental-update stamps, and register its identity — or ignore it
-- Filter the grid by **status · tracking · list** chips; search works within any active filter
+- **Tracking modes** per profile: *active* (default), **⊘ archive (view-only)** — browsable but skipped by Update all / Refresh all — and **✕ removed** (dropped from the grid, files kept, restorable from the **hidden** filter; or **🗑 deleted from disk** behind a type-the-name confirm)
+- **Lists** — user-named groups (tags); an account can be on several. Create/rename/delete via **🗂 lists**, tag one from its per-card **🗂**, or **▦ select** several and bulk-assign. Each list becomes a filter chip
+- **Discovery** — folders that appear on disk but aren't tracked get a **🆕 new folders** banner; adopt one to deep-scan it, seed incremental-update stamps, and register its identity — or ignore it (stale ignores self-prune when a folder is gone)
+- **⟳ rescan** waits for the scan to finish and then reports exactly what changed (`+N new, −M removed`)
+- Filter the grid by **status · tracking · list · ⤳ merges** chips; search works within any active filter
 
 **Back up**
-- **💾 backup** snapshots every offgram setting — lists, identity/renames, tracking, hidden, dismissed, health, latest-stamps, the index, and your `config.py` — into a timestamped `.tar.gz` under `~/.cache/offgram/backups/` (login sessions excluded). Download a copy off-machine, or restore from the list; restore snapshots the current state first and reloads in place, no restart
+- **💾 backup** snapshots every offgram setting — lists, identity/renames, tracking, hidden, dismissed, health, merges, dedup hashes, latest-stamps, the index, and your `config.py` — into a timestamped `.tar.gz` under `~/.cache/offgram/backups/` (login sessions excluded). Restore from the list (snapshots current state first, reloads in place)
 
 **Fast on a slow archive**
 - Scans the archive **once** (in parallel) into a local cache; pages render from it and never re-walk the archive
-- **Cached thumbnails** (ffmpeg) keep grids light — small tiles instead of full images — and are **pre-warmed in the background** so first-browse is instant
+- **Cached thumbnails** (ffmpeg) keep grids light and are **pre-warmed in the background** so first-browse is instant
 - The archive is touched only on first scan and when loading media, never to render a page
 
 ## Requires the patched instaloader fork
 
-Stock instaloader `4.15.1` is **broken against current Instagram** (retired `doc_id` / GraphQL changes), and Instagram now returns `403` to anonymous requests. offgram therefore depends on a fork carrying the unmerged fixes, and needs a logged-in session:
+Stock instaloader `4.15.1` is **broken against current Instagram** (retired `doc_id` / GraphQL changes), and Instagram now returns `403` to anonymous requests. offgram therefore depends on a fork carrying the unmerged fixes, and needs a logged-in session for updates and the authenticated heartbeat:
 
 ```
 instaloader @ git+https://github.com/mholzinger/instaloader@fix-profile-metadata-web-profile-info
@@ -55,11 +73,10 @@ instaloader @ git+https://github.com/mholzinger/instaloader@fix-profile-metadata
 
 ```bash
 pipx install git+https://github.com/mholzinger/offgram
-brew install ffmpeg          # for thumbnails and video poster frames
+brew install ffmpeg          # thumbnails, video poster frames, perceptual hashing
 ```
 
-This pulls in the patched instaloader fork automatically and gives you an
-`offgram` command.
+This pulls in the patched instaloader fork automatically and gives you an `offgram` command.
 
 **Or from a checkout (for development):**
 
@@ -93,6 +110,7 @@ Add more accounts the same way — they appear in the in-app account switcher.
 | `OFFGRAM_COLLECTION` | — | archive root (folder of per-profile subfolders) |
 | `OFFGRAM_LOGIN` | — | default instaloader session username |
 | `OFFGRAM_CONFIG` | — | explicit path to a `config.py` |
+| `OFFGRAM_STOGRAM_DB` | — | default source `.stogram.sqlite` for **⇪ import** rehydration |
 | `OFFGRAM_PORT` | `8077` | web server port |
 | `OFFGRAM_PREWARM` | `1` | background thumbnail pre-warm (`0` to disable) |
 | `OFFGRAM_EPHEMERAL` | `1` | grab stories/highlights/reels on update (`0` = posts only) |
@@ -107,41 +125,36 @@ offgram                    # if pipx-installed
 # then open http://localhost:8077
 ```
 
-First launch scans the collection in the background (slower the first time; cached
-forever after). Hit **⟳ rescan** after large external changes; per-profile **↻ update**
-re-scans that profile automatically when instaloader finishes.
+First launch scans the collection in the background (slower the first time; cached forever after). Hit **⟳ rescan** after large external changes; per-profile **↻ update** re-scans that profile automatically when instaloader finishes.
 
 ## How it works
 
-- **Local cache** (`~/.cache/offgram/`): the file listing is scanned once into
-  `index.json`; every page renders from that in-memory index, so browsing never
-  re-walks the archive — instant even when the files live on a network share.
-- **Parallel scan**: profiles are scanned concurrently, since the cost is per-directory
-  I/O latency rather than CPU.
-- **Thumbnails**: generated with ffmpeg (~360 px) and cached under `~/.cache/offgram/thumbs/`;
-  legacy 4K Stogram thumbnails are reused when present. A gentle background pass
-  pre-warms thumbnails for instaloader profiles so first-browse is instant.
-- **Updates**: each profile runs a posts pass plus separate stories/highlights/reels
-  passes (highlights use the `{profile}` dirname token so they land flat in
-  `highlights/` instead of per-collection folders). Passes are spaced out to avoid
-  Instagram throttling.
-- offgram never writes to the archive itself — only instaloader does, via the update
-  buttons. If offgram breaks, your folders are untouched and browsable in Finder.
+- **Local cache** (`~/.cache/offgram/`): the file listing is scanned once into `index.json`; every page renders from that in-memory index, so browsing never re-walks the archive — instant even on a network share. Overlays (`identity.json`, `tracking.json`, `lists.json`, `merges.json`, `phash.json`, …) live alongside it.
+- **Parallel scan**: profiles are scanned concurrently, since the cost is per-directory I/O latency rather than CPU.
+- **Thumbnails**: generated with ffmpeg and cached under `~/.cache/offgram/thumbs/`; legacy 4K Stogram thumbnails are reused when present. A gentle background pass pre-warms them.
+- **Dedup hashing**: a DCT-based perceptual hash (pHash) is computed from each cached thumbnail (videos use their poster frame) — robust to Instagram's per-upload re-encoding — and near-duplicates are grouped by Hamming distance using LSH banding so it scales to thousands of posts.
+- **Updates**: each profile runs a posts pass plus separate stories/highlights/reels passes, spaced out to avoid throttling.
 - Runs on `127.0.0.1` only (single-user, local). It is not hardened for network exposure.
+
+## Releases
+
+Tagged releases are cut automatically by GitHub Actions. Maintainers: bump the version in `pyproject.toml`, then push a `v*` tag:
+
+```bash
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+The workflow smoke-tests the build, builds an sdist/wheel, and publishes a GitHub Release with auto-generated notes and `offgram.py` attached. Every push and PR runs a lightweight syntax + import check.
 
 ## Roadmap
 
 Planned, not yet built:
 
-- **Account/session management** — sign out / remove a saved login, add an account by
-  importing a browser session (`instaloader --load-cookies`, sidestepping password +
-  2FA), and detect/refresh stale logins.
-- **Archive-wide dedup / migration** — prune legacy 4K Stogram files where a complete
-  instaloader copy exists, treating instaloader as the source of truth. Dry-run first,
-  reversible, never deletes without confirmation.
+- **Account/session management** — sign out / remove a saved login, import a browser session (`instaloader --load-cookies`, sidestepping password + 2FA), detect/refresh stale logins.
+- **Archive-wide file dedup / migration** — prune legacy 4K Stogram files where a complete instaloader copy exists, treating instaloader as the source of truth. Dry-run first, reversible, never deletes without confirmation. (The merge view already de-duplicates *visually*; this is about reclaiming disk.)
 
 ---
 
 ### Footnote: legacy 4K Stogram archives
 
-offgram grew out of a [4K Stogram](https://www.4kdownload.com/products/stogram) collection, and still reads one if it happens to find it — captions and original-post URLs from a `.stogram.sqlite` in the archive root, and thumbnails from `.thumb.stogram/` folders. This is **optional legacy support**: 4K Stogram is effectively abandoned (chronic account lockouts), and a pure instaloader archive never touches any of it. If you have an old 4K Stogram export, offgram will quietly surface its captions and thumbnails; if you don't, you'll never know the code is there. The roadmap's refresh + dedup work is about migrating these legacy archives onto instaloader for good.
+offgram grew out of a [4K Stogram](https://www.4kdownload.com/products/stogram) collection, and reads one when it finds it — captions and original-post URLs from a `.stogram.sqlite` in the archive root, and thumbnails from `.thumb.stogram/` folders. The **⇪ import** feature extends this to *separate* source archives, so you can migrate folders in one at a time and rehydrate their metadata. This is optional legacy support: 4K Stogram is effectively abandoned (chronic account lockouts), and a pure instaloader archive never touches any of it.
