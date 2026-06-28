@@ -28,6 +28,7 @@ Design notes:
 import configparser
 import html
 import http.server
+import io
 import json
 import lzma
 import mimetypes
@@ -36,6 +37,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import time
@@ -51,7 +53,11 @@ from pathlib import Path
 # in $OFFGRAM_CONFIG, ~/.config/offgram/, the script's dir, or the cwd. See
 # config.example.py. OFFGRAM_PORT overrides the port.
 # ---------------------------------------------------------------------------
+CONFIG_PATH = None                  # the config.py actually loaded (for backups)
+
+
 def _load_config():
+    global CONFIG_PATH
     import importlib.util
     collection = os.environ.get("OFFGRAM_COLLECTION", "")
     login = os.environ.get("OFFGRAM_LOGIN", "")
@@ -63,6 +69,7 @@ def _load_config():
               Path.cwd() / "config.py"]
     for p in paths:
         if p.is_file():
+            CONFIG_PATH = p
             spec = importlib.util.spec_from_file_location("offgram_user_config", p)
             mod = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(mod)
@@ -196,7 +203,7 @@ def list_profile_names():
     try:
         with os.scandir(ROOT) as it:
             for e in it:
-                if e.is_dir() and not is_hidden(e.name):
+                if e.is_dir() and not is_hidden(e.name) and e.name not in DISMISSED:
                     out.append(e.name)
     except FileNotFoundError:
         pass
@@ -532,6 +539,414 @@ def sync_identity_from_health():
                             username=(h.get("new_username") or folder))
 
 
+# ---------------------------------------------------------------------------
+# Tracking mode — a per-profile, user-set axis orthogonal to health:
+#   * active  (default): updated by update-all / refresh-all, shown in the grid.
+#   * archive (view-only): fully browsable but EXCLUDED from bulk update/refresh —
+#                          for accounts you keep but no longer pull (TRACKING).
+#   * hidden  (removed): dropped from the grid (reachable via the "hidden" filter
+#                        to restore or delete); files stay on disk (HIDDEN).
+# Both persist locally; the archive itself is never touched except by a nuclear
+# delete, which removes the folder from disk.
+# ---------------------------------------------------------------------------
+TRACKING = {}                # folder -> "archive"   (active = absent, the default)
+HIDDEN = set()               # folders removed from the viewer (files kept)
+TRACKING_FILE = CACHE_ROOT / "tracking.json"
+HIDDEN_FILE = CACHE_ROOT / "hidden.json"
+
+
+def load_tracking():
+    global TRACKING
+    if TRACKING_FILE.exists():
+        try:
+            TRACKING = json.loads(TRACKING_FILE.read_text(encoding="utf-8"))
+        except Exception:                             # noqa: BLE001
+            TRACKING = {}
+
+
+def save_tracking():
+    try:
+        CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+        TRACKING_FILE.write_text(json.dumps(TRACKING), encoding="utf-8")
+    except Exception:                                 # noqa: BLE001
+        pass
+
+
+def load_hidden():
+    global HIDDEN
+    if HIDDEN_FILE.exists():
+        try:
+            HIDDEN = set(json.loads(HIDDEN_FILE.read_text(encoding="utf-8")))
+        except Exception:                             # noqa: BLE001
+            HIDDEN = set()
+
+
+def save_hidden():
+    try:
+        CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+        HIDDEN_FILE.write_text(json.dumps(sorted(HIDDEN)), encoding="utf-8")
+    except Exception:                                 # noqa: BLE001
+        pass
+
+
+def is_archived(name):
+    return TRACKING.get(name) == "archive"
+
+
+def is_hidden_profile(name):
+    return name in HIDDEN
+
+
+def set_tracking(folder, mode):
+    """mode: 'archive' (view-only) or 'active' (default; clears the flag)."""
+    if mode == "archive":
+        TRACKING[folder] = "archive"
+    else:
+        TRACKING.pop(folder, None)
+    save_tracking()
+
+
+def purge_profile_state(folder):
+    """Forget a profile everywhere offgram tracks it (index + all state files)."""
+    with INDEX_LOCK:
+        INDEX["profiles"].pop(folder, None)
+    HEALTH.pop(folder, None)
+    IDENTITY.pop(folder, None)
+    TRACKING.pop(folder, None)
+    HIDDEN.discard(folder)
+    for m in LISTS.values():
+        if folder in m:
+            m.remove(folder)
+    save_index()
+    save_health()
+    save_identity()
+    save_tracking()
+    save_hidden()
+    save_lists()
+
+
+def delete_profile(folder):
+    """NUCLEAR: permanently delete a profile's files from disk, then purge all
+    state. Validated as a direct child of ROOT so a crafted name can't escape the
+    archive. Returns True on success."""
+    import shutil
+    try:
+        target = (ROOT / folder).resolve()
+        if target.parent != ROOT.resolve() or not target.is_dir():
+            return False
+    except Exception:                                 # noqa: BLE001
+        return False
+    try:
+        shutil.rmtree(target)
+    except Exception as exc:                           # noqa: BLE001
+        print("delete %s failed: %s" % (folder, exc))
+        return False
+    purge_profile_state(folder)
+    print("deleted %s from disk" % folder)
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Discovery — folders can appear on disk that offgram doesn't know about yet
+# (added directly via instaloader, copied in, etc.). Detect them cheaply (a
+# shallow scandir, no deep walk), then let the user adopt each with a chosen
+# tracking mode — which deep-scans it into the index, seeds incremental-update
+# stamps from its existing files, and registers its identity, so a raw folder
+# becomes a fully-tracked profile. "Ignore" parks a folder so it stops being
+# flagged (and stays out of rescans) until re-added.
+# ---------------------------------------------------------------------------
+DISMISSED = set()                          # folders the user chose to ignore
+DISMISSED_FILE = CACHE_ROOT / "dismissed.json"
+
+
+def load_dismissed():
+    global DISMISSED
+    if DISMISSED_FILE.exists():
+        try:
+            DISMISSED = set(json.loads(DISMISSED_FILE.read_text(encoding="utf-8")))
+        except Exception:                             # noqa: BLE001
+            DISMISSED = set()
+
+
+def save_dismissed():
+    try:
+        CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+        DISMISSED_FILE.write_text(json.dumps(sorted(DISMISSED)), encoding="utf-8")
+    except Exception:                                 # noqa: BLE001
+        pass
+
+
+def find_new_folders():
+    """Folders present on disk but not yet in the index and not ignored. Cheap:
+    a single shallow scandir of ROOT, no per-profile deep read."""
+    new = []
+    try:
+        with os.scandir(ROOT) as it:
+            for e in it:
+                if (e.is_dir() and not is_hidden(e.name)
+                        and e.name not in INDEX["profiles"]
+                        and e.name not in DISMISSED):
+                    new.append(e.name)
+    except FileNotFoundError:
+        pass
+    return sorted(new, key=str.lower)
+
+
+def adopt_profile(folder, mode="active"):
+    """Onboard an on-disk folder into offgram: deep-scan it into the index, seed
+    incremental-update stamps from its existing files (so the first update isn't a
+    full re-download), and register its identity. mode='archive' marks it
+    view-only. Returns True on success."""
+    if "/" in folder or folder.startswith(".") or not (ROOT / folder).is_dir():
+        return False
+    DISMISSED.discard(folder)
+    save_dismissed()
+    rec = scan_profile(folder)
+    with INDEX_LOCK:
+        INDEX["profiles"][folder] = rec
+    save_index()
+    seed_stamps(folder)                    # make the first update incremental
+    uid = profile_userid(folder)
+    if uid:
+        update_identity(folder, userid=uid, username=folder)
+    set_tracking(folder, "archive" if mode == "archive" else "active")
+    print("adopted %s (%s, %d items)" % (folder, mode, rec.get("total", 0)))
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Lists — user-named groups (tags). A profile can belong to many lists at once;
+# lists are an organizational axis orthogonal to health/tracking. Stored as
+# {list-name: [folders]} so list membership and counts are both cheap. Names are
+# free-form (rendered escaped, filtered by render-local index, so any characters
+# are safe).
+# ---------------------------------------------------------------------------
+LISTS = {}                                 # list-name -> [folders]
+LISTS_FILE = CACHE_ROOT / "lists.json"
+
+
+def load_lists():
+    global LISTS
+    if LISTS_FILE.exists():
+        try:
+            LISTS = json.loads(LISTS_FILE.read_text(encoding="utf-8"))
+        except Exception:                             # noqa: BLE001
+            LISTS = {}
+
+
+def save_lists():
+    try:
+        CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+        LISTS_FILE.write_text(json.dumps(LISTS), encoding="utf-8")
+    except Exception:                                 # noqa: BLE001
+        pass
+
+
+def norm_list_name(s):
+    return (s or "").strip()[:60]
+
+
+def list_names():
+    return sorted(LISTS.keys(), key=str.lower)
+
+
+def folder_lists(folder):
+    return sorted([name for name, m in LISTS.items() if folder in m], key=str.lower)
+
+
+def list_create(name):
+    name = norm_list_name(name)
+    if not name:
+        return False
+    LISTS.setdefault(name, [])
+    save_lists()
+    return True
+
+
+def list_rename(old, new):
+    new = norm_list_name(new)
+    if old not in LISTS or not new or new in LISTS:
+        return False
+    LISTS[new] = LISTS.pop(old)
+    save_lists()
+    return True
+
+
+def list_delete(name):
+    if name in LISTS:
+        del LISTS[name]
+        save_lists()
+        return True
+    return False
+
+
+def list_set_folder(folder, names):
+    """Replace the set of lists a single folder belongs to (per-card menu).
+    Unknown names are created."""
+    desired = {norm_list_name(n) for n in names if norm_list_name(n)}
+    for name in desired:
+        LISTS.setdefault(name, [])
+    for name, m in LISTS.items():
+        if name in desired and folder not in m:
+            m.append(folder)
+        elif name not in desired and folder in m:
+            m.remove(folder)
+    save_lists()
+    return True
+
+
+def list_assign(name, folders):
+    """Add a batch of folders to one list (bulk assign). Creates the list."""
+    name = norm_list_name(name)
+    if not name:
+        return False
+    m = LISTS.setdefault(name, [])
+    for f in folders:
+        if f and f not in m:
+            m.append(f)
+    save_lists()
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Backup & restore — bundle ALL offgram settings/state (lists, identity/renames,
+# tracking, hidden, dismissed, health, latest-stamps, account, the index, and the
+# config.py) into a single timestamped .tar.gz under ~/.cache/offgram/backups.
+# Login sessions are NOT included (they live in ~/.config/instaloader and carry
+# auth). Restore snapshots the current state first, then extracts and reloads in
+# place — no server restart needed.
+# ---------------------------------------------------------------------------
+BACKUP_DIR = CACHE_ROOT / "backups"
+
+
+def backup_paths():
+    return [INDEX_FILE, HEARTBEAT_FILE, HEARTBEAT_PROGRESS_FILE, IDENTITY_FILE,
+            TRACKING_FILE, HIDDEN_FILE, DISMISSED_FILE, LISTS_FILE, ACCOUNT_FILE,
+            STAMPS_FILE, REFRESH_FILE, SCAN_FILE]
+
+
+def _human_size(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return ("%d %s" % (n, unit)) if unit == "B" else ("%.1f %s" % (n, unit))
+        n /= 1024.0
+    return "%.1f TB" % n
+
+
+def _prune_backups(keep=15):
+    files = sorted(BACKUP_DIR.glob("offgram-backup-*.tar.gz"))
+    for f in files[:-keep]:
+        try:
+            f.unlink()
+        except Exception:                             # noqa: BLE001
+            pass
+
+
+def make_backup():
+    """Write a timestamped tar.gz of all settings; returns the file path."""
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    out = BACKUP_DIR / ("offgram-backup-%s.tar.gz" % ts)
+    seq = 2                                            # avoid same-second collisions
+    while out.exists():
+        out = BACKUP_DIR / ("offgram-backup-%s-%d.tar.gz" % (ts, seq))
+        seq += 1
+    included = []
+    with tarfile.open(str(out), "w:gz") as tar:
+        for p in backup_paths():
+            if p.exists():
+                tar.add(str(p), arcname=p.name)
+                included.append(p.name)
+        if CONFIG_PATH and Path(CONFIG_PATH).is_file():
+            tar.add(str(CONFIG_PATH), arcname="config/config.py")
+            included.append("config/config.py")
+        manifest = json.dumps({"created": ts, "version": 1, "files": included,
+                               "profiles": len(INDEX.get("profiles", {})),
+                               "lists": len(LISTS)}).encode("utf-8")
+        info = tarfile.TarInfo("manifest.json")
+        info.size = len(manifest)
+        tar.addfile(info, io.BytesIO(manifest))
+    _prune_backups()
+    print("backup written: %s" % out.name)
+    return out
+
+
+def list_backups():
+    out = []
+    if BACKUP_DIR.is_dir():
+        for f in sorted(BACKUP_DIR.glob("offgram-backup-*.tar.gz"), reverse=True):
+            try:
+                st = f.stat()
+                out.append({"name": f.name, "size": _human_size(st.st_size),
+                            "when": time.strftime("%Y-%m-%d %H:%M",
+                                                  time.localtime(st.st_mtime))})
+            except Exception:                         # noqa: BLE001
+                pass
+    return out
+
+
+def restore_backup(name):
+    """Restore settings from a backup (by filename in BACKUP_DIR, or a full path).
+    Snapshots current state first, then extracts whitelisted members by basename
+    (no extractall — immune to path traversal) and reloads everything in memory."""
+    if (SCAN["running"] or REFRESH["running"] or HEARTBEAT["running"]
+            or QUICK["running"] or any_running()):
+        return False, "stop running jobs first (scan / refresh / heartbeat / update)"
+    src = (BACKUP_DIR / name if ("/" not in name and "\\" not in name)
+           else Path(name).expanduser())
+    if not src.is_file():
+        return False, "backup not found"
+    try:
+        tar = tarfile.open(str(src), "r:gz")
+    except Exception as exc:                           # noqa: BLE001
+        return False, "not a valid backup (%s)" % exc
+    try:
+        names = {m.name for m in tar.getmembers() if m.isfile()}
+        if "manifest.json" not in names:
+            return False, "missing manifest — not an offgram backup"
+        whitelist = {p.name for p in backup_paths()} | {"config/config.py"}
+        make_backup()                                 # safety snapshot before overwrite
+        CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+        restored = 0
+        config_note = ""
+        for m in tar.getmembers():
+            if not m.isfile() or m.name not in whitelist:
+                continue
+            data = tar.extractfile(m)
+            if data is None:
+                continue
+            blob = data.read()
+            if m.name == "config/config.py":
+                dest_dir = Path.home() / ".config" / "offgram"
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                live = dest_dir / "config.py"
+                target = live if not live.exists() else dest_dir / "config.restored.py"
+                target.write_bytes(blob)
+                config_note = (" · config restored to %s (applies on next restart)"
+                               % target.name)
+            else:
+                (CACHE_ROOT / m.name).write_bytes(blob)
+                restored += 1
+    finally:
+        tar.close()
+    # reload every in-memory store from the freshly-restored files
+    global ACTIVE_LOGIN
+    load_index()
+    load_health()
+    load_hb_progress()
+    load_identity()
+    sync_identity_from_health()
+    load_tracking()
+    load_hidden()
+    load_dismissed()
+    load_lists()
+    load_refresh()
+    ACTIVE_LOGIN = None                                # re-read account.txt lazily
+    _il["ctx"], _il["tried"] = None, False
+    return True, ("restored %d settings files%s (a safety snapshot of the previous "
+                  "state was saved first)" % (restored, config_note))
+
+
 def _il_context():
     """Lazily build a logged-in instaloader context, or None if unavailable.
     Imported lazily so the viewer still runs without instaloader installed."""
@@ -643,7 +1058,8 @@ def start_heartbeat(profiles=None):
     if HEARTBEAT["running"]:
         return False
     names = (profiles if profiles is not None
-             else sorted(INDEX["profiles"].keys(), key=str.lower))
+             else [n for n in sorted(INDEX["profiles"].keys(), key=str.lower)
+                   if not is_hidden_profile(n)])
     HEARTBEAT.update({"queue": list(names), "total": len(names), "done": 0,
                       "stop": False})
     save_hb_progress()
@@ -692,7 +1108,8 @@ def quick_check_all():
         return
     QUICK["running"] = True
     try:
-        names = sorted(INDEX["profiles"].keys(), key=str.lower)
+        names = [n for n in sorted(INDEX["profiles"].keys(), key=str.lower)
+                 if not is_hidden_profile(n)]
         QUICK["total"], QUICK["done"] = len(names), 0
 
         def one(n):
@@ -928,10 +1345,12 @@ def seed_stamps(profile):
     CACHE_ROOT.mkdir(parents=True, exist_ok=True)
     with open(STAMPS_FILE, "w") as f:
         cfg.write(f)
-    JOBS[profile]["log"].append(
-        "offgram: seeded latest-stamps from existing archive (%s)"
-        % ", ".join("%s=%s" % (k, datetime.fromtimestamp(v, timezone.utc).date())
-                    for k, v in newest.items()))
+    job = JOBS.get(profile)               # may be called outside an update job (adopt)
+    if job is not None:
+        job["log"].append(
+            "offgram: seeded latest-stamps from existing archive (%s)"
+            % ", ".join("%s=%s" % (k, datetime.fromtimestamp(v, timezone.utc).date())
+                        for k, v in newest.items()))
 
 
 def run_update(profiles):
@@ -1029,7 +1448,8 @@ def start_refresh(profiles=None):
         return False
     if profiles is None:
         profiles = [p for p in sorted(INDEX["profiles"], key=str.lower)
-                    if HEALTH.get(p, {}).get("status") != "dead"]
+                    if HEALTH.get(p, {}).get("status") != "dead"
+                    and not is_archived(p) and not is_hidden_profile(p)]
     REFRESH.update({"queue": list(profiles), "total": len(profiles), "done": 0,
                     "failed": [], "paused": False, "stop": False})
     save_refresh()
@@ -1129,6 +1549,34 @@ header h1{font-size:17px;margin:0;font-weight:600}
  border-radius:7px;cursor:pointer;font-size:13px}
 .btn:hover{background:#34343e}
 .btn.go{background:#2c5fb3;border-color:#2c5fb3}.btn.go:hover{background:#3570cf}
+.btn.danger{background:#3a1d1d;border-color:#7a2a2a;color:#ffb4b4}
+.btn.danger:hover{background:#5a2626}
+.actions{margin-top:8px;display:flex;gap:6px;flex-wrap:wrap}
+.actions .btn{padding:4px 9px;font-size:12px}
+.tag{display:inline-block;margin-left:6px;padding:1px 7px;border-radius:10px;
+ font-size:11px;background:#2a2a32;color:#9a9aa3;vertical-align:middle}
+.legsep{display:inline-block;width:1px;height:14px;background:#2a2a32;margin:0 2px}
+.drow{display:flex;align-items:center;gap:8px;margin-top:8px;flex-wrap:wrap}
+.drow .dn{font-weight:600;min-width:160px}
+.card{position:relative}
+.card .sel{position:absolute;top:8px;left:8px;z-index:5;display:none;
+ width:18px;height:18px;cursor:pointer}
+body.selmode .card .sel{display:block}
+#modal{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;z-index:70;
+ align-items:center;justify-content:center}
+.mbox{background:#16161a;border:1px solid #2a2a32;border-radius:12px;padding:18px 20px;
+ width:min(440px,92vw);max-height:82vh;overflow:auto}
+.mbox h3{margin:0 0 12px;font-size:16px}
+.lrows{max-height:42vh;overflow:auto;margin-bottom:10px}
+.lrow{display:flex;align-items:center;gap:8px;padding:5px 2px}
+.lrow .dn{flex:1}
+.newrow{display:flex;gap:8px;margin:8px 0}
+.newrow input,#sellist{background:#0e0e10;border:1px solid #3a3a44;color:#e7e7ea;
+ padding:6px 9px;border-radius:7px;font-size:13px}
+.mbtns{display:flex;gap:8px;margin-top:12px}
+#selbar{position:fixed;left:50%;bottom:18px;transform:translateX(-50%);z-index:65;
+ display:none;gap:10px;align-items:center;background:#16161a;border:1px solid #2c5fb3;
+ border-radius:10px;padding:10px 14px;box-shadow:0 6px 20px rgba(0,0,0,.5)}
 .wrap{padding:18px}
 .grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fill,minmax(190px,1fr))}
 .card{background:#16161a;border:1px solid #24242a;border-radius:10px;overflow:hidden}
@@ -1238,8 +1686,19 @@ function igName(s){return (s||'').toLowerCase().replace(/^@/,'').replace(/[^a-z0
 var gstatus='all';
 function filtStatus(el){document.querySelectorAll('.lf').forEach(function(x){x.classList.remove('active');});
  el.classList.add('active');gstatus=el.dataset.status;
- var db=document.getElementById('deepbtn');if(db)db.style.display=(gstatus==='all')?'none':'';
+ var db=document.getElementById('deepbtn');
+ if(db)db.style.display=(['alive','private','dead','renamed','unchecked'].indexOf(gstatus)>=0)?'':'none';
  doSearch();}
+function matchFilter(c){var hid=c.getAttribute('data-hidden')==='1';
+ var tr=c.getAttribute('data-track')||'active',st=c.getAttribute('data-status')||'unchecked';
+ if(gstatus==='all')return !hid;
+ if(gstatus==='hidden')return hid;
+ if(hid)return false;
+ if(gstatus==='tracked')return tr==='active';
+ if(gstatus==='archive')return tr==='archive';
+ if(gstatus.indexOf('list:')===0){var id=gstatus.slice(5);
+  return (c.getAttribute('data-lists')||'').split(' ').indexOf(id)>=0;}
+ return st===gstatus;}
 function quickCheck(){fetch('/quickcheck',{method:'POST'}).then(function(){setTimeout(livePoll,300);});}
 function deepCheck(){if(gstatus==='all'){alert('Pick a status filter first (e.g. dead).');return;}
  if(!confirm('Deep-check the \\''+gstatus+'\\' accounts with the authenticated API? Burns IG calls only on that bucket.'))return;
@@ -1249,7 +1708,7 @@ function doSearch(){var q=igName(document.getElementById('search').value);
  var cards=document.querySelectorAll('.card'),any=false,exact=false;
  cards.forEach(function(c){var n=c.getAttribute('data-name')||'';
   var st=c.getAttribute('data-status')||'unchecked';
-  var nameHit=q===''||n.indexOf(q)>=0, statHit=gstatus==='all'||st===gstatus;
+  var nameHit=q===''||n.indexOf(q)>=0, statHit=matchFilter(c);
   var hit=nameHit&&statHit;c.style.display=hit?'':'none';
   if(nameHit)any=true;if(n===q)exact=true;});
  var ab=document.getElementById('addbar');ab.textContent='';
@@ -1267,6 +1726,98 @@ function addProfile(name){name=igName(name);if(!name)return;
  showLog();fetch('/add',{method:'POST',
   headers:{'Content-Type':'application/x-www-form-urlencoded'},
   body:'profile='+encodeURIComponent(name)}).then(function(){poll(true);});}
+function setTrack(p,mode){fetch('/track',{method:'POST',
+ headers:{'Content-Type':'application/x-www-form-urlencoded'},
+ body:'profile='+encodeURIComponent(p)+'&mode='+mode}).then(function(){location.reload();});}
+function removeProfile(p){if(!confirm('Remove @'+p+' from offgram?\\n\\nFiles stay on disk — restore any time from the \\u201chidden\\u201d filter.'))return;
+ fetch('/remove',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
+  body:'profile='+encodeURIComponent(p)+'&mode=hide'}).then(function(){location.reload();});}
+function restoreProfile(p){fetch('/remove',{method:'POST',
+ headers:{'Content-Type':'application/x-www-form-urlencoded'},
+ body:'profile='+encodeURIComponent(p)+'&mode=restore'}).then(function(){location.reload();});}
+function deleteProfile(p){var t=prompt('PERMANENTLY delete @'+p+' and ALL its files from disk? This cannot be undone.\\n\\nType the name to confirm:');
+ if(t===null)return;if(t!==p){alert('Name did not match \\u2014 nothing deleted.');return;}
+ fetch('/remove',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
+  body:'profile='+encodeURIComponent(p)+'&mode=delete&confirm='+encodeURIComponent(t)})
+  .then(function(r){return r.json();}).then(function(d){
+   if(d.ok){location.reload();}else{alert('Delete failed: '+(d.error||'unknown'));}});}
+function adopt(f,mode){
+ if(mode==='ignore'&&!confirm('Ignore '+decodeURIComponent(f)+'? Left untracked and kept out of rescans until you re-add it.'))return;
+ fetch('/adopt',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
+  body:'folder='+f+'&mode='+mode}).then(function(r){return r.json();}).then(function(d){
+   if(d.ok){location.reload();}else{alert('Could not '+mode+' '+decodeURIComponent(f));}});}
+/* ---- Lists (feature 8): named groups / tags ---- */
+function escapeAttr(s){return (s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+function initLists(){var dl=document.getElementById('alllists');if(!dl)return;
+ dl.innerHTML='';(window.ALL_LISTS||[]).forEach(n=>{var o=document.createElement('option');o.value=n;dl.appendChild(o);});}
+function postLists(params){var b=Object.keys(params).map(k=>k+'='+encodeURIComponent(params[k])).join('&');
+ return fetch('/lists',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:b})
+  .then(r=>r.json()).then(d=>{if(d.ok){location.reload();}else{alert('List action failed.');}});}
+function openModal(h){document.getElementById('mbox').innerHTML=h;document.getElementById('modal').style.display='flex';}
+function closeModal(){document.getElementById('modal').style.display='none';}
+function openLists(folder){
+ var card=document.querySelector(`.card[data-folder="${folder}"]`);
+ var idxs=((card&&card.getAttribute('data-lists'))||'').split(' ').filter(Boolean);
+ var mine={};idxs.forEach(i=>{mine[(window.ALL_LISTS||[])[+i]]=1;});
+ var rows=(window.ALL_LISTS||[]).map(n=>
+  `<label class="lrow"><input type="checkbox" data-n="${escapeAttr(n)}"${mine[n]?' checked':''}> ${escapeHTML(n)}</label>`).join('');
+ if(!rows)rows='<div class="sub">No lists yet — add one below.</div>';
+ openModal(`<h3>Lists for @${escapeHTML(decodeURIComponent(folder))}</h3>`+
+  `<div class="lrows">${rows}</div>`+
+  `<div class="newrow"><input id="newlist" placeholder="new list…"><button class="btn" onclick="addNewListRow()">+ add</button></div>`+
+  `<div class="mbtns"><button class="btn go" onclick="applyLists('${folder}')">save</button><button class="btn" onclick="closeModal()">cancel</button></div>`);}
+function addNewListRow(){var inp=document.getElementById('newlist');var v=(inp.value||'').trim();if(!v)return;
+ var box=document.querySelector('#modal .lrows');var l=document.createElement('label');l.className='lrow';
+ l.innerHTML=`<input type="checkbox" checked data-n="${escapeAttr(v)}"> ${escapeHTML(v)}`;box.appendChild(l);inp.value='';}
+function applyLists(folder){var names=[];
+ document.querySelectorAll('#modal .lrows input:checked').forEach(c=>names.push(c.getAttribute('data-n')));
+ postLists({action:'set',folder:decodeURIComponent(folder),lists:JSON.stringify(names)});}
+function openManage(){
+ var rows=(window.ALL_LISTS||[]).map(n=>
+  `<div class="lrow"><span class="dn">${escapeHTML(n)}</span>`+
+  `<button class="btn" data-n="${escapeAttr(n)}" onclick="renameList(this.getAttribute('data-n'))">rename</button>`+
+  `<button class="btn danger" data-n="${escapeAttr(n)}" onclick="deleteList(this.getAttribute('data-n'))">delete</button></div>`).join('');
+ if(!rows)rows='<div class="sub">No lists yet.</div>';
+ openModal(`<h3>Manage lists</h3>${rows}`+
+  `<div class="newrow"><input id="mklist" placeholder="new list…"><button class="btn go" onclick="createList()">+ create</button></div>`+
+  `<div class="mbtns"><button class="btn" onclick="closeModal()">close</button></div>`);}
+function createList(){var v=(document.getElementById('mklist').value||'').trim();if(!v)return;postLists({action:'create',name:v});}
+function renameList(n){var v=prompt('Rename list to:',n);if(v===null||!v.trim()||v.trim()===n)return;postLists({action:'rename',name:n,newname:v.trim()});}
+function deleteList(n){if(!confirm('Delete list "'+n+'"? Accounts stay, just ungrouped.'))return;postLists({action:'delete',name:n});}
+function toggleSelect(){document.body.classList.toggle('selmode');
+ if(!document.body.classList.contains('selmode'))document.querySelectorAll('.card .sel:checked').forEach(c=>c.checked=false);
+ selChanged();}
+function selChanged(){var n=document.querySelectorAll('.card .sel:checked').length;
+ var sc=document.getElementById('selcount');if(sc)sc.textContent=n+' selected';
+ var bar=document.getElementById('selbar');if(bar)bar.style.display=(document.body.classList.contains('selmode')&&n>0)?'flex':'none';}
+function clearSel(){document.querySelectorAll('.card .sel:checked').forEach(c=>c.checked=false);selChanged();}
+function assignSelected(){var name=(document.getElementById('sellist').value||'').trim();
+ if(!name){alert('Type or pick a list name.');return;}
+ var folders=[];document.querySelectorAll('.card .sel:checked').forEach(c=>{var card=c.closest('.card');if(card)folders.push(decodeURIComponent(card.getAttribute('data-folder')));});
+ if(!folders.length){alert('Select some accounts first.');return;}
+ postLists({action:'assign',name:name,folders:JSON.stringify(folders)});}
+document.addEventListener('keydown',e=>{if(e.key==='Escape'){var m=document.getElementById('modal');if(m&&m.style.display==='flex')closeModal();}});
+/* ---- Backup & restore ---- */
+function openBackup(){fetch('/backups').then(r=>r.json()).then(d=>{
+ var rows=(d.backups||[]).map(b=>
+  `<div class="lrow"><span class="dn">${escapeHTML(b.name)}<br><span class="sub">${escapeHTML(b.size)} · ${escapeHTML(b.when)}</span></span>`+
+  `<a class="btn" href="/backupfile?name=${encodeURIComponent(b.name)}">download</a>`+
+  `<button class="btn go" data-n="${escapeAttr(b.name)}" onclick="restoreBackup(this.getAttribute('data-n'))">restore</button></div>`).join('');
+ if(!rows)rows='<div class="sub">No backups yet — create one below.</div>';
+ openModal(`<h3>Backup &amp; restore</h3>`+
+  `<div class="sub" style="margin:0 0 10px">All offgram settings — lists, identity/renames, tracking, hidden, dismissed, health, latest-stamps, the index, and config. Login sessions are not included.</div>`+
+  `<div class="mbtns"><button class="btn go" onclick="createBackup()">＋ Create backup now</button></div>`+
+  `<div class="lrows" style="margin-top:10px">${rows}</div>`+
+  `<div class="mbtns"><button class="btn" onclick="closeModal()">close</button></div>`);});}
+function createBackup(){fetch('/backup',{method:'POST'}).then(r=>r.json()).then(d=>{
+ if(d.ok){alert('Backup created: '+d.name+'\\nUse Download to keep a copy off-machine.');openBackup();}
+ else alert('Backup failed: '+(d.error||'unknown'));});}
+function restoreBackup(n){
+ if(!confirm('Restore from '+n+'?\\n\\nThis replaces your current offgram settings (lists, tracking, identity, etc.). A safety snapshot of the current state is saved first.'))return;
+ fetch('/restore',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
+  body:'name='+encodeURIComponent(n)}).then(r=>r.json()).then(d=>{
+   if(d.ok){alert('Restored — '+(d.summary||'')+'\\n\\nReloading.');location.reload();}
+   else alert('Restore failed: '+(d.error||'unknown'));});}
 if(document.getElementById('banners'))livePoll();   // index: live banner updates, no reload
 """
 
@@ -1282,6 +1833,8 @@ def page(title, body, extra_js=""):
             "<div id='log'><div class='loghdr'>activity log"
             "<span class='x' onclick=\"document.getElementById('log')"
             ".style.display='none'\">×</span></div><div id='logbody'></div></div>"
+            "<div id='modal' onclick='if(event.target===this)closeModal()'>"
+            "<div class='mbox' id='mbox'></div></div>"
             "<script>%s</script><script>%s</script></body></html>"
             % (html.escape(title), CSS, body, JS_COMMON, extra_js)).encode("utf-8")
 
@@ -1314,6 +1867,33 @@ def refresh_banner():
     fail = (" · %d failed" % s["failed"]) if s["failed"] else ""
     return ("<div class='banner'>Refreshing archive — %d/%d (%d%%) · %s%s%s "
             "&nbsp; %s</div>" % (s["done"], s["total"], pct, state, cur, fail, ctl))
+
+
+def discover_panel():
+    """Banner offering to onboard folders found on disk but not yet tracked, plus
+    a line to re-add any the user previously ignored."""
+    out = ""
+    new = find_new_folders()
+    if new:
+        rows = "".join(
+            "<div class='drow'><span class='dn'>%s</span>"
+            "<button class='btn go' onclick=\"adopt('%s','active')\">+ track</button>"
+            "<button class='btn' onclick=\"adopt('%s','archive')\">⊘ archive-only</button>"
+            "<button class='btn' onclick=\"adopt('%s','ignore')\">✕ ignore</button></div>"
+            % (html.escape(n), urllib.parse.quote(n),
+               urllib.parse.quote(n), urllib.parse.quote(n))
+            for n in new)
+        out += ("<div class='banner'><b>🆕 %d new folder%s on disk</b> — not tracked "
+                "yet. Adopting deep-scans it, seeds incremental-update stamps from "
+                "its existing files, and registers its identity.%s</div>"
+                % (len(new), "" if len(new) == 1 else "s", rows))
+    if DISMISSED:
+        ig = " · ".join(
+            "%s <a href='#' onclick=\"adopt('%s','readd');return false\">re-add</a>"
+            % (html.escape(n), urllib.parse.quote(n)) for n in sorted(DISMISSED))
+        out += ("<div class='sub' style='margin:0 0 12px'>Ignored folders: %s</div>"
+                % ig)
+    return out
 
 
 def heartbeat_banner():
@@ -1365,6 +1945,7 @@ def render_index():
         body = ("<header><h1>offgram</h1><span class='sp'></span></header>"
                 "<div class='wrap'><div id='banners'>%s</div></div>" % scan_banner())
         return page("indexing…", body)
+    lnames = list_names()
     cards = []
     for name, rec in profiles:
         pe = urllib.parse.quote(name)
@@ -1383,32 +1964,76 @@ def render_index():
         if handle != name:
             disp += (" <span style='color:#6e7681;font-weight:400;font-size:11px'>"
                      "(was %s)</span>" % html.escape(name))
+        hid = is_hidden_profile(name)
+        arch = is_archived(name)
+        lidx = " ".join(str(i) for i, L in enumerate(lnames) if name in LISTS[L])
+        # build each button fully-formed (pe may contain '%' from quoting; never
+        # let a pre-substituted fragment become part of a later % format string)
+        listb = ("<button class='btn' onclick=\"openLists('%s')\" title='Lists'>🗂</button>"
+                 % pe)
+        rmb = ("<button class='btn' onclick=\"removeProfile('%s')\" "
+               "title='Remove from offgram (keep files)'>✕</button>" % pe)
+        if hid:
+            actions = (("<button class='btn' onclick=\"restoreProfile('%s')\">↶ restore"
+                        "</button>" % pe)
+                       + ("<button class='btn danger' onclick=\"deleteProfile('%s')\" "
+                          "title='Permanently delete files from disk'>🗑 delete from disk"
+                          "</button>" % pe))
+            tag = "<span class='tag'>removed</span>"
+        elif arch:
+            actions = (("<button class='btn' onclick=\"setTrack('%s','active')\" "
+                        "title='Resume updates'>▶ track</button>" % pe) + listb + rmb)
+            tag = "<span class='tag'>archive-only</span>"
+        else:
+            actions = (("<button class='btn' onclick=\"upd('%s')\">↻ update</button>" % pe)
+                       + ("<button class='btn' onclick=\"setTrack('%s','archive')\" "
+                          "title='View-only: stop updating'>⊘ archive</button>" % pe)
+                       + listb + rmb)
+            tag = ""
         cards.append(
-            "<div class='card' data-name='%s' data-status='%s'>"
+            "<div class='card' data-name='%s' data-folder='%s' data-status='%s' "
+            "data-track='%s' data-hidden='%s' data-lists='%s'>"
+            "<input type='checkbox' class='sel' onclick='selChanged()'>"
             "<a class='thumb' href='/p/%s'>%s"
             "<span class='badge'>%d</span></a><div class='meta'>"
-            "<b>%s%s</b><div class='s2'>%s</div>"
-            "<button class='btn' style='margin-top:8px' onclick=\"upd('%s')\">↻ update</button>"
-            "</div></div>"
-            % (html.escape(searchkey),
+            "<b>%s%s</b><div class='s2'>%s%s</div>"
+            "<div class='actions'>%s</div></div></div>"
+            % (html.escape(searchkey), pe,
                ((HEALTH.get(name) or {}).get("status") or "unchecked"),
+               "archive" if arch else "active", "1" if hid else "0", lidx,
                pe, img, rec["total"], health_dot(HEALTH.get(name)),
-               disp, html.escape(bits or "empty"), pe))
+               disp, html.escape(bits or "empty"), tag, actions))
     built = time.strftime("%Y-%m-%d %H:%M", time.localtime(INDEX.get("built", 0)))
     stcounts = {}
     for n, _ in profiles:
         st = (HEALTH.get(n) or {}).get("status") or "unchecked"
         stcounts[st] = stcounts.get(st, 0) + 1
 
-    def lf(status, label, swatch):
-        cnt = "" if status == "all" else " (%d)" % stcounts.get(status, 0)
+    n_hidden = sum(1 for n, _ in profiles if is_hidden_profile(n))
+    n_archive = sum(1 for n, _ in profiles
+                    if is_archived(n) and not is_hidden_profile(n))
+    n_tracked = sum(1 for n, _ in profiles
+                    if not is_archived(n) and not is_hidden_profile(n))
+
+    def lf(status, label, swatch, cnt=None):
+        if status == "all":
+            cntstr = ""
+        else:
+            c = cnt if cnt is not None else stcounts.get(status, 0)
+            cntstr = " (%d)" % c
         active = " active" if status == "all" else ""
         return ("<span class='lf%s' data-status='%s' onclick='filtStatus(this)'>%s%s%s</span>"
-                % (active, status, swatch, label, cnt))
+                % (active, status, swatch, label, cntstr))
 
     ring = ("<span class='dot' style='background:transparent;"
             "box-shadow:inset 0 0 0 1.6px #6e7681'></span>")
     sw = lambda c: "<span class='dot' style='background:%s'></span>" % c
+    listchips = ""
+    if lnames:
+        listchips = "<span class='legsep'></span>" + "".join(
+            lf("list:%d" % i, "🗂 " + html.escape(L), "",
+               sum(1 for f in LISTS[L] if f in INDEX["profiles"]))
+            for i, L in enumerate(lnames))
     legend = ("<div class='legend'>"
               + lf("all", "all", "")
               + lf("alive", "alive", sw("#3fb950"))
@@ -1416,6 +2041,11 @@ def render_index():
               + lf("dead", "dead", sw("#f85149"))
               + lf("renamed", "renamed", sw("#539bf5"))
               + lf("unchecked", "not checked", ring)
+              + "<span class='legsep'></span>"
+              + lf("tracked", "↻ tracked", "", n_tracked)
+              + lf("archive", "⊘ archive", "", n_archive)
+              + lf("hidden", "✕ hidden", "", n_hidden)
+              + listchips
               + "<button class='btn' id='deepbtn' style='display:none' "
               "onclick='deepCheck()'>🔬 deep-check filtered (authenticated)</button>"
               + "<span style='margin-left:auto;color:#6e7681'>click to filter · "
@@ -1440,12 +2070,21 @@ def render_index():
             "<button class='btn' onclick='heartbeat()'>♥ Check all</button>"
             "<button class='btn' onclick='rescan()'>⟳ rescan</button>"
             "<button class='btn go' onclick='refreshAll()'>⟲ Refresh all</button>"
+            "<button class='btn' onclick='openManage()'>🗂 lists</button>"
+            "<button class='btn' onclick='toggleSelect()'>▦ select</button>"
+            "<button class='btn' onclick='openBackup()'>💾 backup</button>"
             "<button class='btn' onclick='toggleLog()'>▤ log</button></header>"
             "%s<div class='wrap'><div class='addbar' id='addbar'></div>"
-            "<div id='banners'>%s%s</div><div class='grid'>%s</div></div>"
-            % (len(profiles), built, acct, legend, scan_banner(),
-               refresh_banner(), "".join(cards)))
-    return page("offgram", body)
+            "<div id='selbar'><b id='selcount'>0 selected</b>"
+            "<input id='sellist' list='alllists' placeholder='list name…'>"
+            "<button class='btn go' onclick='assignSelected()'>assign → list</button>"
+            "<button class='btn' onclick='clearSel()'>clear</button>"
+            "<datalist id='alllists'></datalist></div>"
+            "<div id='banners'>%s%s</div>%s<div class='grid'>%s</div></div>"
+            % (n_tracked + n_archive, built, acct, legend, scan_banner(),
+               refresh_banner(), discover_panel(), "".join(cards)))
+    return page("offgram", body,
+                "window.ALL_LISTS=%s;initLists();" % json.dumps(lnames))
 
 
 def render_profile(profile):
@@ -1555,6 +2194,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
                        "heartbeat": dict(HEARTBEAT), "refresh": refresh_snapshot(),
                        "jobs": jobs_payload}
             return self._send(200, json.dumps(payload).encode(), "application/json")
+        if path == "/backups":
+            return self._send(200, json.dumps({"backups": list_backups()}).encode(),
+                              "application/json")
+        if path == "/backupfile":
+            name = qs.get("name", [""])[0]
+            if not name or "/" in name or "\\" in name:
+                return self._send(400, b"bad name")
+            f = BACKUP_DIR / name
+            if not f.is_file():
+                return self._send(404, b"not found")
+            return self._send(200, f.read_bytes(), "application/gzip",
+                              {"Content-Disposition": 'attachment; filename="%s"' % name})
         return self._send(404, b"not found")
 
     do_HEAD = do_GET
@@ -1572,7 +2223,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._send(400, b'{"ok":false}', "application/json")
         if u.path == "/update-all":
             ps = [p for p in INDEX["profiles"]
-                  if not (p in JOBS and JOBS[p]["running"])]
+                  if not (p in JOBS and JOBS[p]["running"])
+                  and not is_archived(p) and not is_hidden_profile(p)]
             threading.Thread(target=run_update, args=(ps,), daemon=True).start()
             return self._send(200, b'{"ok":true}', "application/json")
         if u.path == "/rescan":
@@ -1631,6 +2283,95 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     REFRESH["queue"] = []
                 save_refresh()
             return self._send(200, b'{"ok":true}', "application/json")
+        if u.path == "/track":
+            p = form.get("profile", [""])[0]
+            mode = form.get("mode", ["active"])[0]
+            if p in INDEX["profiles"] and mode in ("active", "archive"):
+                set_tracking(p, mode)
+                return self._send(200, b'{"ok":true}', "application/json")
+            return self._send(400, b'{"ok":false}', "application/json")
+        if u.path == "/remove":
+            p = form.get("profile", [""])[0]
+            mode = form.get("mode", ["hide"])[0]
+            if p not in INDEX["profiles"]:
+                return self._send(400, b'{"ok":false,"error":"unknown profile"}',
+                                  "application/json")
+            if mode == "hide":
+                HIDDEN.add(p)
+                save_hidden()
+            elif mode == "restore":
+                HIDDEN.discard(p)
+                save_hidden()
+            elif mode == "delete":
+                if form.get("confirm", [""])[0] != p:
+                    return self._send(400,
+                                      b'{"ok":false,"error":"name did not match"}',
+                                      "application/json")
+                if not delete_profile(p):
+                    return self._send(500,
+                                      b'{"ok":false,"error":"delete failed"}',
+                                      "application/json")
+            else:
+                return self._send(400, b'{"ok":false}', "application/json")
+            return self._send(200, b'{"ok":true}', "application/json")
+        if u.path == "/adopt":
+            folder = form.get("folder", [""])[0]
+            mode = form.get("mode", ["active"])[0]
+            if not folder or "/" in folder or folder.startswith("."):
+                return self._send(400, b'{"ok":false}', "application/json")
+            if mode == "ignore":
+                if (ROOT / folder).is_dir():
+                    DISMISSED.add(folder)
+                    save_dismissed()
+                    return self._send(200, b'{"ok":true}', "application/json")
+            elif mode == "readd":
+                DISMISSED.discard(folder)
+                save_dismissed()
+                return self._send(200, b'{"ok":true}', "application/json")
+            elif mode in ("active", "archive") and adopt_profile(folder, mode):
+                return self._send(200, b'{"ok":true}', "application/json")
+            return self._send(400, b'{"ok":false}', "application/json")
+        if u.path == "/lists":
+            action = form.get("action", [""])[0]
+
+            def _json_arr(field):
+                try:
+                    v = json.loads(form.get(field, ["[]"])[0])
+                    return [str(x) for x in v] if isinstance(v, list) else []
+                except Exception:                     # noqa: BLE001
+                    return []
+            ok = False
+            if action == "create":
+                ok = list_create(form.get("name", [""])[0])
+            elif action == "rename":
+                ok = list_rename(form.get("name", [""])[0],
+                                 form.get("newname", [""])[0])
+            elif action == "delete":
+                ok = list_delete(form.get("name", [""])[0])
+            elif action == "set":
+                folder = form.get("folder", [""])[0]
+                if folder in INDEX["profiles"]:
+                    ok = list_set_folder(folder, _json_arr("lists"))
+            elif action == "assign":
+                folders = [f for f in _json_arr("folders") if f in INDEX["profiles"]]
+                ok = list_assign(form.get("name", [""])[0], folders)
+            return self._send(200 if ok else 400,
+                              b'{"ok":true}' if ok else b'{"ok":false}',
+                              "application/json")
+        if u.path == "/backup":
+            try:
+                out = make_backup()
+                return self._send(200, json.dumps({"ok": True, "name": out.name}).encode(),
+                                  "application/json")
+            except Exception as exc:                   # noqa: BLE001
+                return self._send(500, json.dumps({"ok": False,
+                                  "error": str(exc)[:200]}).encode(), "application/json")
+        if u.path == "/restore":
+            ok, msg = restore_backup(form.get("name", [""])[0])
+            key = "summary" if ok else "error"
+            return self._send(200 if ok else 400,
+                              json.dumps({"ok": ok, key: msg}).encode(),
+                              "application/json")
         return self._send(404, b"not found")
 
     def serve_thumb(self, rel):
@@ -1705,6 +2446,10 @@ def main():
     load_hb_progress()
     load_identity()
     sync_identity_from_health()      # seed registry from any known user-ids / renames
+    load_tracking()
+    load_hidden()
+    load_dismissed()
+    load_lists()
     load_refresh()
     have_cache = load_index()
     pending = [p for p in load_scan_pending() if (ROOT / p).is_dir()]

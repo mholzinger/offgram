@@ -19,12 +19,22 @@ It's a single dependency-free Python file (standard library only). The archive c
 - Per-profile **↻ update** and **↻ Update all** buttons run instaloader, with live progress in a collapsible **▤ log** panel; updates are **incremental** (`--latest-stamps`), never full re-downloads
 - **Ephemeral capture** — updates also pull **stories, highlights, and reels** in separate instaloader passes, each routed into its own section subfolder so the tabs populate (reels also arrive in-feed with posts)
 - **Add a new profile** — type an un-archived `@name` in the search box and hit **Archive @name**; instaloader downloads it and it joins the grid
+- **⟲ Refresh all** runs a slow, resumable, throttle-aware whole-archive refresh in the background (a profile every few minutes, pausable, resumes after a restart); skips dead and archive-only accounts
 
 **Accounts**
 - An **"as @account"** switcher in the header lists your saved instaloader sessions; the active account is used for both updates and the heartbeat, and the choice persists across restarts
 
 **Status (heartbeat)**
 - **♥ Check all** pings Instagram via your session and marks every profile with a colored dot: 🟢 alive · 🟡 private · 🔴 dead · 🔵 renamed (hover for the new handle) · ⚪ not checked. A legend sits in the header. Throttled and on-demand only; rename detection uses the account's numeric user-id (parsed from filenames), so it survives username changes
+
+**Organize**
+- **Tracking modes** per profile: *active* (default), **⊘ archive (view-only)** — fully browsable but skipped by Update all / Refresh all, for accounts you keep but no longer pull — and **✕ removed** (dropped from the grid, files kept, reachable under the **hidden** filter to restore). A removed profile can be **🗑 deleted from disk** behind a type-the-name confirm when you truly want it gone
+- **Lists** — user-named groups (tags); an account can be on several at once. Create/rename/delete via **🗂 lists**, add one account from its per-card **🗂**, or **▦ select** several and bulk-assign. Each list becomes a filter chip
+- **Discovery** — folders that show up on disk but aren't tracked (added straight via instaloader, copied in) are flagged in a **🆕 new folders** banner; adopt one to deep-scan it, seed incremental-update stamps, and register its identity — or ignore it
+- Filter the grid by **status · tracking · list** chips; search works within any active filter
+
+**Back up**
+- **💾 backup** snapshots every offgram setting — lists, identity/renames, tracking, hidden, dismissed, health, latest-stamps, the index, and your `config.py` — into a timestamped `.tar.gz` under `~/.cache/offgram/backups/` (login sessions excluded). Download a copy off-machine, or restore from the list; restore snapshots the current state first and reloads in place, no restart
 
 **Fast on a slow archive**
 - Scans the archive **once** (in parallel) into a local cache; pages render from it and never re-walk the archive
@@ -123,13 +133,9 @@ re-scans that profile automatically when instaloader finishes.
 
 Planned, not yet built:
 
-- **Identity management** — sign out / remove an account, add an account by importing
-  a browser session (`instaloader --load-cookies`, sidestepping password + 2FA), and
-  detect/refresh stale logins.
-- **Stale-archive refresh engine** — a slow, resumable, throttle-aware background job
-  that brings every legacy profile current via instaloader, with trackable progress
-  (queue, per-profile status, pause/resume). The migration path for old 4K Stogram
-  archives.
+- **Account/session management** — sign out / remove a saved login, add an account by
+  importing a browser session (`instaloader --load-cookies`, sidestepping password +
+  2FA), and detect/refresh stale logins.
 - **Archive-wide dedup / migration** — prune legacy 4K Stogram files where a complete
   instaloader copy exists, treating instaloader as the source of truth. Dry-run first,
   reversible, never deletes without confirmation.
