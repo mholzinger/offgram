@@ -1,0 +1,27 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Byte-compile (syntax check)
+        run: python -m py_compile offgram.py
+      - name: Import smoke test
+        env:
+          OFFGRAM_COLLECTION: ${{ runner.temp }}/offgram-archive
+        run: |
+          mkdir -p "$OFFGRAM_COLLECTION"
+          python -c "import offgram; print('import OK:', offgram.__name__)"
