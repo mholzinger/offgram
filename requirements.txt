@@ -5,5 +5,10 @@
 # GraphQL changes). This fork carries the unmerged fixes.
 instaloader @ git+https://github.com/mholzinger/instaloader@fix-profile-metadata-web-profile-info
 
+# Optional: enables "⚙ accounts → import" (load a session from a logged-in
+# browser via instaloader --load-cookies). Without it, create sessions the normal
+# way (instaloader --login). Firefox/Chrome are most reliable; Safari is flaky.
+browser_cookie3
+
 # System (non-pip) dependency, optional: ffmpeg — used to generate poster frames
 # for videos that have no thumbnail. Install via `brew install ffmpeg`.

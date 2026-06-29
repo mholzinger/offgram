@@ -750,6 +750,94 @@ def set_login(name):
     return True
 
 
+def _session_dir():
+    return Path.home() / ".config" / "instaloader"
+
+
+def remove_session(name):
+    """Sign out: delete a saved instaloader session file. Clears the active
+    account if it was the one removed."""
+    global ACTIVE_LOGIN
+    if name not in list_sessions():
+        return False
+    try:
+        (_session_dir() / ("session-" + name)).unlink()
+    except Exception:                                 # noqa: BLE001
+        return False
+    if current_login() == name:
+        ACTIVE_LOGIN = ""
+        try:
+            ACCOUNT_FILE.unlink()
+        except Exception:                             # noqa: BLE001
+            pass
+        _il["ctx"], _il["tried"] = None, False
+    return True
+
+
+def test_session(name):
+    """Return the logged-in username if the saved session is still valid (a live
+    authenticated call), or None if it's expired/stale. On-demand only."""
+    if name not in list_sessions():
+        return None
+    try:
+        import instaloader
+        loader = instaloader.Instaloader(quiet=True)
+        loader.load_session_from_file(name)
+        return loader.test_login()                    # username if valid, else None
+    except Exception:                                 # noqa: BLE001
+        return None
+
+
+# Browser-cookie import — run `instaloader --load-cookies BROWSER` to create a
+# session from a logged-in browser, sidestepping password + 2FA. Streamed like an
+# update so the user sees progress; the new session then appears in the switcher.
+COOKIE_JOB = {"running": False, "log": [], "browser": "", "before": []}
+
+
+def import_cookies_worker(browser, username):
+    COOKIE_JOB.update({"running": True, "log": [], "browser": browser,
+                       "before": list_sessions()})
+    log = COOKIE_JOB["log"]
+    cmd = [sys.executable, "-m", "instaloader", "--load-cookies", browser]
+    if username:
+        cmd += ["--login", username]
+    log.append("$ " + " ".join(cmd))
+    try:
+        proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, bufsize=1)
+        for line in proc.stdout:
+            line = line.rstrip("\n")
+            if line:
+                log.append(line)
+                if len(log) > 200:
+                    del log[:len(log) - 200]
+        proc.wait()
+        new = [s for s in list_sessions() if s not in COOKIE_JOB["before"]]
+        if new:
+            log.append("offgram: imported session(s): %s" % ", ".join(new))
+        elif any("browser_cookie3" in l for l in log):
+            log.append("offgram: the cookie reader is missing — install it once with"
+                       "  pip install browser_cookie3  (then retry).")
+        elif proc.returncode == 0:
+            log.append("offgram: no new session appeared — make sure you're logged "
+                       "into Instagram in that browser. Firefox/Chrome are most "
+                       "reliable; Safari cookie access is unreliable on macOS.")
+        log.append("--- finished (exit %s) ---" % proc.returncode)
+    except Exception as exc:                          # noqa: BLE001
+        log.append("error: %s" % exc)
+    finally:
+        COOKIE_JOB["running"] = False
+
+
+def start_cookie_import(browser, username):
+    if COOKIE_JOB["running"]:
+        return False
+    threading.Thread(target=import_cookies_worker, args=(browser, username),
+                     daemon=True).start()
+    return True
+
+
 def load_health():
     global HEALTH
     if HEARTBEAT_FILE.exists():
@@ -2671,6 +2759,45 @@ function restoreBackup(n){
   body:'name='+encodeURIComponent(n)}).then(r=>r.json()).then(d=>{
    if(d.ok){alert('Restored — '+(d.summary||'')+'\\n\\nReloading.');location.reload();}
    else alert('Restore failed: '+(d.error||'unknown'));});}
+/* ---- Accounts / sessions ---- */
+function openAccounts(){fetch('/sessions').then(r=>r.json()).then(d=>{
+ var rows=(d.sessions||[]).map(function(s){return ''
+  +'<div class="lrow"><span class="dn">'+(s.active?'● ':'')+'@'+escapeHTML(s.name)
+  +' <span class="sub" id="st-'+escapeAttr(s.name)+'"></span></span>'
+  +'<button class="btn" data-n="'+escapeAttr(s.name)+'" onclick="testSession(this.getAttribute(\\'data-n\\'))">test</button>'
+  +(s.active?'<span class="sub">active</span>'
+    :'<button class="btn go" data-n="'+escapeAttr(s.name)+'" onclick="useSession(this.getAttribute(\\'data-n\\'))">use</button>')
+  +'<button class="btn danger" data-n="'+escapeAttr(s.name)+'" onclick="removeSession(this.getAttribute(\\'data-n\\'))">sign out</button></div>';}).join('');
+ if(!rows)rows='<div class="sub">No saved sessions — import one from your browser below.</div>';
+ var opts=['firefox','chrome','safari','edge','brave','chromium','opera','vivaldi']
+  .map(function(b){return '<option value="'+b+'">'+b+'</option>';}).join('');
+ openModal('<h3>Accounts</h3><div class="lrows">'+rows+'</div>'
+  +'<div class="sub" style="margin:12px 0 6px">Import a session from a logged-in browser (no password / 2FA):</div>'
+  +'<div class="newrow"><select id="impbrowser">'+opts+'</select>'
+  +'<input id="impuser" placeholder="username (optional)">'
+  +'<button class="btn go" onclick="importCookies()">⇪ import</button></div>'
+  +'<div id="implog" class="sub" style="white-space:pre-wrap;margin-top:8px"></div>'
+  +'<div class="mbtns"><button class="btn" onclick="closeModal()">close</button></div>');
+ if(d.importing)pollCookieImport();});}
+function testSession(n){var el=document.getElementById('st-'+n);if(el)el.textContent='…testing';
+ fetch('/account',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
+  body:'action=test&login='+encodeURIComponent(n)}).then(function(r){return r.json();}).then(function(d){
+   if(el)el.textContent=d.valid?('✓ valid (@'+d.username+')'):'✗ stale — re-import';});}
+function useSession(n){fetch('/account',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
+  body:'login='+encodeURIComponent(n)}).then(function(){location.reload();});}
+function removeSession(n){if(!confirm('Sign out and delete the saved session for @'+n+'?\\n\\nYour archive is untouched.'))return;
+ fetch('/account',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
+  body:'action=remove&login='+encodeURIComponent(n)}).then(function(){openAccounts();});}
+function importCookies(){var b=document.getElementById('impbrowser').value;
+ var u=(document.getElementById('impuser').value||'').trim();
+ fetch('/account',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
+  body:'action=import&browser='+encodeURIComponent(b)+'&login='+encodeURIComponent(u)})
+  .then(function(r){return r.json();}).then(function(d){
+   if(!d.ok){alert('Import: '+(d.note||'failed'));return;}pollCookieImport();});}
+function pollCookieImport(){fetch('/sessions').then(function(r){return r.json();}).then(function(d){
+  var el=document.getElementById('implog');if(el)el.textContent=(d.importlog||[]).join('\\n');
+  if(d.importing){setTimeout(pollCookieImport,1500);}
+  else if(el){el.textContent+='\\n(done — reloading account list)';setTimeout(openAccounts,900);}});}
 if(document.getElementById('banners'))livePoll();   // index: live banner updates, no reload
 """
 
@@ -3000,6 +3127,7 @@ def render_index():
             "<button class='btn' onclick='openManage()'>🗂 lists</button>"
             "<button class='btn' onclick='toggleSelect()'>▦ select</button>"
             "<button class='btn' onclick='openBackup()'>💾 backup</button>"
+            "<button class='btn' onclick='openAccounts()'>⚙ accounts</button>"
             "<button class='btn' onclick='toggleLog()'>▤ log</button></header>"
             "%s<div class='wrap'><div class='addbar' id='addbar'></div>"
             "<div id='selbar'><b id='selcount'>0 selected</b>"
@@ -3265,6 +3393,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/backups":
             return self._send(200, json.dumps({"backups": list_backups()}).encode(),
                               "application/json")
+        if path == "/sessions":
+            cur = current_login()
+            payload = {"sessions": [{"name": s, "active": s == cur}
+                                    for s in list_sessions()],
+                       "importing": COOKIE_JOB["running"],
+                       "importlog": COOKIE_JOB["log"][-30:]}
+            return self._send(200, json.dumps(payload).encode(), "application/json")
         if path == "/backupfile":
             name = qs.get("name", [""])[0]
             if not name or "/" in name or "\\" in name:
@@ -3430,7 +3565,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._send(200, b'{"ok":true}', "application/json")
             return self._send(400, b'{"ok":false}', "application/json")
         if u.path == "/account":
-            ok = set_login(form.get("login", [""])[0])
+            action = form.get("action", ["switch"])[0]
+            login = form.get("login", [""])[0]
+            if action == "remove":
+                ok = remove_session(login)
+            elif action == "test":
+                user = test_session(login)
+                return self._send(200, json.dumps(
+                    {"ok": True, "valid": bool(user), "username": user}).encode(),
+                    "application/json")
+            elif action == "import":
+                ok = start_cookie_import(
+                    form.get("browser", ["firefox"])[0].strip().lower(), login.strip())
+                return self._send(200 if ok else 409,
+                                  b'{"ok":true}' if ok else
+                                  b'{"ok":false,"note":"import already running"}',
+                                  "application/json")
+            else:                                     # switch
+                ok = set_login(login)
             return self._send(200 if ok else 400,
                               b'{"ok":true}' if ok else b'{"ok":false}',
                               "application/json")

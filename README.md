@@ -24,6 +24,10 @@ It's a single dependency-free Python file (standard library only). The archive c
 - **Add a new profile** — type an un-archived `@name` in the search box and hit **Archive @name**
 - **⟲ Refresh all** runs a slow, resumable, throttle-aware whole-archive refresh in the background; skips dead and archive-only accounts
 
+**Accounts & sessions**
+- An **"as @account"** switcher in the header picks the active instaloader session (used for updates and the authenticated heartbeat); the choice persists across restarts
+- **⚙ accounts** opens a manager to **import a session straight from a logged-in browser** (`--load-cookies` — no password, no 2FA), **test** whether a saved session is still valid (a live login check, flags stale/expired ones), **switch** between accounts, and **sign out** (delete a saved session). Your archive is never touched
+
 **Health & validation**
 - **⚡ Quick check** — anonymous, login-free liveness triage across all profiles (cheap reachability, fired in parallel)
 - **♥ Check all** — authenticated heartbeat via your session; marks every profile with a colored dot: 🟢 alive · 🟡 private · 🔴 dead · 🔵 renamed (hover for the new handle) · ⚪ not checked. Rename detection uses the account's numeric user-id (parsed from filenames), so it survives username changes
@@ -101,7 +105,7 @@ Create the instaloader session the update buttons and heartbeat use (one time pe
 instaloader --login YOUR_USERNAME
 ```
 
-Add more accounts the same way — they appear in the in-app account switcher.
+Add more accounts the same way — they appear in the in-app account switcher. Or skip the CLI entirely: in the running app, **⚙ accounts → import** pulls a session straight from a logged-in browser (`--load-cookies`), no password or 2FA required. Browser import needs the optional `browser_cookie3` package (`pip install browser_cookie3`); **Firefox or Chrome are the most reliable** — Safari cookie access is flaky on macOS.
 
 ### Environment variables (override config)
 
@@ -171,7 +175,6 @@ The workflow smoke-tests the build, builds an sdist/wheel, and publishes a GitHu
 
 Planned, not yet built:
 
-- **Account/session management** — sign out / remove a saved login, import a browser session (`instaloader --load-cookies`, sidestepping password + 2FA), detect/refresh stale logins.
 - **Archive-wide file dedup / migration** — prune legacy 4K Stogram files where a complete instaloader copy exists, treating instaloader as the source of truth. Dry-run first, reversible, never deletes without confirmation. (The merge view already de-duplicates *visually*; this is about reclaiming disk.)
 
 ---
