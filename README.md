@@ -129,6 +129,25 @@ offgram                    # if pipx-installed
 
 First launch scans the collection in the background (slower the first time; cached forever after). Hit **⟳ rescan** after large external changes; per-profile **↻ update** re-scans that profile automatically when instaloader finishes.
 
+### Multiple archives / fresh testing
+
+Because the cache is keyed per archive (see [How it works](#how-it-works)), you can run several collections side by side — each gets its own isolated index, health, lists, merges, and dedup hashes, with **no clobbering**. Point `OFFGRAM_COLLECTION` at the archive and `OFFGRAM_PORT` at a free port:
+
+```bash
+# a second, independent gallery for another archive
+OFFGRAM_COLLECTION=/Volumes/whatever/other-archive OFFGRAM_PORT=8078 offgram
+# → http://localhost:8078, cache under ~/.cache/offgram/<name>-<hash>/
+
+# a throwaway/empty archive for testing — just works, real library untouched
+OFFGRAM_COLLECTION=/tmp/test-archive OFFGRAM_PORT=8079 offgram
+```
+
+Use `OFFGRAM_CACHE` to pin an explicit cache directory, or `OFFGRAM_CACHE_HOME` to relocate the base that holds the per-archive dirs.
+
+### Diagnostics
+
+Append `?debug=1` to any page (or press **Shift+D**) for an opt-in overlay that samples DOM node count, JS heap (Chrome only), fetch rate, and live timer count over time — handy for spotting a slow client-side leak. History is exportable from the console via `copy(JSON.stringify(__leak.hist))`.
+
 ## How it works
 
 - **Local cache, keyed per archive** (`~/.cache/offgram/<name>-<pathhash>/`): the file listing is scanned once into `index.json`; every page renders from that in-memory index, so browsing never re-walks the archive — instant even on a network share. Overlays (`identity.json`, `tracking.json`, `lists.json`, `merges.json`, `phash.json`, …) live alongside it. The cache dir is derived from a stable hash of the archive's canonical path, so pointing offgram at a different collection (e.g. a throwaway test archive) gets its own isolated cache instead of clobbering another's — no token is written into the archive. Set `OFFGRAM_CACHE` to force a specific dir. (An older single flat cache is migrated into its per-archive dir automatically on first run.)
