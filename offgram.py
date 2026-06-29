@@ -1931,9 +1931,14 @@ def seed_stamps(profile):
     rec = INDEX["profiles"].get(profile)
     if not rec:
         return
-    cfg = configparser.ConfigParser()
+    # strict=False tolerates a duplicated section/key (last wins); the try guards
+    # any other corruption so a bad stamps file never aborts an update.
+    cfg = configparser.ConfigParser(strict=False)
     if STAMPS_FILE.exists():
-        cfg.read(STAMPS_FILE)
+        try:
+            cfg.read(STAMPS_FILE)
+        except Exception:                             # noqa: BLE001
+            cfg = configparser.ConfigParser(strict=False)
     if cfg.has_section(profile):
         return                      # already tracked by a real update; never override
     newest = {}
@@ -1966,16 +1971,30 @@ def run_update(profiles):
         with JOBS_LOCK:
             JOBS[profile] = {"running": True, "log": [], "rc": None}
     for profile in profiles:
-        seed_stamps(profile)
-        _run_one(profile)
-        # refresh just this profile in the index after download
         try:
-            rec = scan_profile(profile)
-            with INDEX_LOCK:
-                INDEX["profiles"][profile] = rec
-            save_index()
-        except Exception:                             # noqa: BLE001
-            pass
+            seed_stamps(profile)
+            _run_one(profile)
+            # refresh just this profile in the index after download
+            try:
+                rec = scan_profile(profile)
+                with INDEX_LOCK:
+                    INDEX["profiles"][profile] = rec
+                save_index()
+            except Exception:                         # noqa: BLE001
+                pass
+        except Exception as exc:                       # noqa: BLE001
+            try:
+                JOBS[profile]["log"].append("offgram: update aborted — %s" % exc)
+            except Exception:                          # noqa: BLE001
+                pass
+        finally:
+            # never leave a job falsely "running" if a pass threw before _run_one
+            with JOBS_LOCK:
+                j = JOBS.get(profile)
+                if j and j.get("running"):
+                    j["running"] = False
+                    if j.get("rc") is None:
+                        j["rc"] = -1
 
 
 # ---------------------------------------------------------------------------
@@ -2309,10 +2328,11 @@ function rescan(){fetch('/rescan',{method:'POST'}).then(function(){
     reloading, else new folders aren't in the index yet and look missed. */
  var seen=false,n=0;
  var t=setInterval(function(){n++;
+  if(n>200){clearInterval(t);location.reload();return;}   // hard cap even if /status keeps failing
   fetch('/status').then(function(r){return r.json();}).then(function(s){
    var sc=(s&&s.scan)||{},run=!!sc.running;
    if(run)seen=true;
-   if((seen&&!run)||(!seen&&n>=4)||n>200){clearInterval(t);
+   if((seen&&!run)||(!seen&&n>=4)){clearInterval(t);
     var a=sc.added||[],d=sc.removed||[];
     var msg='Rescan complete — '+(sc.total||0)+' folder'+(sc.total===1?'':'s')+' scanned.';
     if(a.length)msg+='\\n\\n+ '+a.length+' new: '+a.slice(0,10).join(', ')+(a.length>10?'…':'');
@@ -2339,17 +2359,28 @@ function refreshCtl(a){fetch('/refresh',{method:'POST',
  body:'action='+a}).then(function(){setTimeout(livePoll,300);});}
 /* Live-update just the progress banner via polling — no full-page reload, so
    browsing/scroll/lightbox are never interrupted. Index only. */
-function livePoll(){fetch('/banners').then(function(r){return r.json();}).then(function(d){
- var b=document.getElementById('banners'); if(b)b.innerHTML=d.html;
- if(d.active){setTimeout(livePoll,4000);}
- else if(document.querySelectorAll('.card').length===0){location.reload();}});}
+var _liveLoop=false,_liveHTML=null;
+function livePoll(){
+ if(_liveLoop)return;            // single chain only — callers may fire this repeatedly
+ _liveLoop=true;
+ (function tick(){
+  fetch('/banners').then(function(r){return r.json();}).then(function(d){
+   var b=document.getElementById('banners');
+   if(b&&d.html!==_liveHTML){b.innerHTML=d.html;_liveHTML=d.html;}  // touch DOM only on change
+   if(d.active){setTimeout(tick,4000);}
+   else{_liveLoop=false;
+        if(document.querySelectorAll('.card').length===0)location.reload();}
+  }).catch(function(){_liveLoop=false;});   // release guard so a later action can restart
+ })();
+}
 /* ---- leak-debug overlay: opt-in via ?debug=1 or Shift+D. Wraps fetch + interval
    timers and samples DOM node count / JS heap (Chrome only) over time, so a slow
    leak is visible in minutes. Rates are vs the first sample; history is in
    window.__leak.hist (copy(JSON.stringify(__leak.hist)) to export). ---- */
 var __leak={fetches:0,timers:0,peak:0,hist:[],base:null,box:null,iv:null,t0:0};
 (function(){var of=window.fetch;window.fetch=function(){__leak.fetches++;return of.apply(this,arguments);};
- var osi=window.setInterval,oci=window.clearInterval;__leak._osi=osi;__leak._oci=oci;
+ var osi=window.setInterval,oci=window.clearInterval;
+ __leak._osi=osi.bind(window);__leak._oci=oci.bind(window);   // must run on window, not __leak
  window.setInterval=function(){__leak.timers++;if(__leak.timers>__leak.peak)__leak.peak=__leak.timers;return osi.apply(this,arguments);};
  window.clearInterval=function(id){if(__leak.timers>0)__leak.timers--;return oci.call(this,id);};})();
 function leakSample(){
@@ -2456,6 +2487,7 @@ function importAll(){
    livePoll();   /* show the progress banner */
    var seen=false,n=0;
    var t=setInterval(function(){n++;
+    if(n>900){clearInterval(t);location.reload();return;}   // hard cap (~30min) even if /status fails
     fetch('/status').then(function(r){return r.json();}).then(function(s){
      var im=(s&&s['import'])||{};
      if(im.running){seen=true;return;}
@@ -2610,7 +2642,8 @@ function buildDedupe(mid){
    if(!d.ok){alert('Could not start hashing: '+(d.note||'unknown'));return;}
    alert('Hashing images in the background — this can take a while for a large merge. '
     +'The page will reload into the deduped view when it finishes.');
-   var t=setInterval(function(){
+   var n=0,t=setInterval(function(){n++;
+    if(n>1200){clearInterval(t);location.href='/m/'+encodeURIComponent(mid)+'?dedupe=1';return;}
     fetch('/status').then(function(r){return r.json();}).then(function(s){
      if((s&&s.phash&&s.phash.running))return;
      clearInterval(t);location.href='/m/'+encodeURIComponent(mid)+'?dedupe=1';
