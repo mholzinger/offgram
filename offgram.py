@@ -26,6 +26,7 @@ Design notes:
 """
 
 import configparser
+import hashlib
 import html
 import http.server
 import io
@@ -97,8 +98,51 @@ SIDECAR_NAME = ".offgram-stogram.json"     # offgram's own per-folder rehydrated
 PORT = int(os.environ.get("OFFGRAM_PORT", "8077"))
 HOST = "127.0.0.1"
 
-# Cache lives on LOCAL disk, never inside the archive.
-CACHE_ROOT = Path.home() / ".cache" / "offgram"
+# Cache lives on LOCAL disk, never inside the archive. It is keyed PER ARCHIVE so
+# pointing offgram at a different collection (e.g. a fresh test archive) gets its
+# own isolated index/health/merges/phash instead of clobbering another's. The key
+# is a stable hash of the canonical archive path plus a readable prefix, e.g.
+# ~/.cache/offgram/4K_Stogram-3f9a1c22/ — deterministic, no token written into the
+# archive, no registry. $OFFGRAM_CACHE forces an explicit cache dir (skips keying).
+def _resolve_cache_root():
+    explicit = os.environ.get("OFFGRAM_CACHE")
+    if explicit:
+        return Path(explicit).expanduser(), None
+    base = Path(os.environ.get("OFFGRAM_CACHE_HOME",
+                               str(Path.home() / ".cache" / "offgram"))).expanduser()
+    real = str(COLLECTION.resolve())
+    key = "%s-%s" % (re.sub(r"[^A-Za-z0-9._-]", "_", COLLECTION.name)[:40] or "archive",
+                     hashlib.sha256(real.encode("utf-8")).hexdigest()[:10])
+    return base / key, base
+
+
+def _migrate_flat_cache(base, dest):
+    """One-time upgrade: older offgram kept a single flat cache directly in `base`.
+    If that legacy layout is present and the per-archive dir doesn't exist yet, move
+    it wholesale into `dest` (the current collection's keyed dir) so nobody loses
+    their index/merges/phash. A move, not a copy — reversible, same filesystem."""
+    if base is None or dest.exists() or not (base / "index.json").is_file():
+        return
+    import shutil
+    dest.mkdir(parents=True, exist_ok=True)
+    for entry in list(base.iterdir()):
+        if entry == dest:
+            continue
+        try:
+            shutil.move(str(entry), str(dest / entry.name))
+        except Exception:                             # noqa: BLE001
+            pass
+    print("migrated legacy cache -> %s" % dest)
+
+
+CACHE_ROOT, _CACHE_BASE = _resolve_cache_root()
+_migrate_flat_cache(_CACHE_BASE, CACHE_ROOT)
+try:
+    CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+    (CACHE_ROOT / "meta.json").write_text(
+        json.dumps({"collection": str(COLLECTION.resolve())}), encoding="utf-8")
+except Exception:                                     # noqa: BLE001
+    pass
 INDEX_FILE = CACHE_ROOT / "index.json"
 THUMB_DIR = CACHE_ROOT / "thumbs"                # generated grid thumbnails (images + video)
 THUMB_PX = 360                                   # thumbnail square size, px

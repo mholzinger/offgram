@@ -111,6 +111,8 @@ Add more accounts the same way — they appear in the in-app account switcher.
 | `OFFGRAM_LOGIN` | — | default instaloader session username |
 | `OFFGRAM_CONFIG` | — | explicit path to a `config.py` |
 | `OFFGRAM_STOGRAM_DB` | — | default source `.stogram.sqlite` for **⇪ import** rehydration |
+| `OFFGRAM_CACHE` | — | explicit cache directory (overrides the per-archive keying below) |
+| `OFFGRAM_CACHE_HOME` | `~/.cache/offgram` | base under which per-archive cache dirs are created |
 | `OFFGRAM_PORT` | `8077` | web server port |
 | `OFFGRAM_PREWARM` | `1` | background thumbnail pre-warm (`0` to disable) |
 | `OFFGRAM_EPHEMERAL` | `1` | grab stories/highlights/reels on update (`0` = posts only) |
@@ -129,7 +131,7 @@ First launch scans the collection in the background (slower the first time; cach
 
 ## How it works
 
-- **Local cache** (`~/.cache/offgram/`): the file listing is scanned once into `index.json`; every page renders from that in-memory index, so browsing never re-walks the archive — instant even on a network share. Overlays (`identity.json`, `tracking.json`, `lists.json`, `merges.json`, `phash.json`, …) live alongside it.
+- **Local cache, keyed per archive** (`~/.cache/offgram/<name>-<pathhash>/`): the file listing is scanned once into `index.json`; every page renders from that in-memory index, so browsing never re-walks the archive — instant even on a network share. Overlays (`identity.json`, `tracking.json`, `lists.json`, `merges.json`, `phash.json`, …) live alongside it. The cache dir is derived from a stable hash of the archive's canonical path, so pointing offgram at a different collection (e.g. a throwaway test archive) gets its own isolated cache instead of clobbering another's — no token is written into the archive. Set `OFFGRAM_CACHE` to force a specific dir. (An older single flat cache is migrated into its per-archive dir automatically on first run.)
 - **Parallel scan**: profiles are scanned concurrently, since the cost is per-directory I/O latency rather than CPU.
 - **Thumbnails**: generated with ffmpeg and cached under `~/.cache/offgram/thumbs/`; legacy 4K Stogram thumbnails are reused when present. A gentle background pass pre-warms them.
 - **Dedup hashing**: a DCT-based perceptual hash (pHash) is computed from each cached thumbnail (videos use their poster frame) — robust to Instagram's per-upload re-encoding — and near-duplicates are grouped by Hamming distance using LSH banding so it scales to thousands of posts.
