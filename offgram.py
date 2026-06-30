@@ -50,6 +50,28 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
+
+def _atomic_write_text(path, text):
+    """Write text to `path` atomically: a temp file in the same directory, fsynced,
+    then os.replace()'d into place. A crash or a concurrent reader never sees a
+    half-written file — which is how latest-stamps.ini got corrupted before."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".tmp-", suffix=".w")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 # ---------------------------------------------------------------------------
 # Config — personal settings (collection path, instaloader login). Resolved in
 # priority: env vars OFFGRAM_COLLECTION / OFFGRAM_LOGIN, then a `config.py` found
@@ -140,8 +162,8 @@ CACHE_ROOT, _CACHE_BASE = _resolve_cache_root()
 _migrate_flat_cache(_CACHE_BASE, CACHE_ROOT)
 try:
     CACHE_ROOT.mkdir(parents=True, exist_ok=True)
-    (CACHE_ROOT / "meta.json").write_text(
-        json.dumps({"collection": str(COLLECTION.resolve())}), encoding="utf-8")
+    _atomic_write_text(CACHE_ROOT / "meta.json",
+                       json.dumps({"collection": str(COLLECTION.resolve())}))
 except Exception:                                     # noqa: BLE001
     pass
 INDEX_FILE = CACHE_ROOT / "index.json"
@@ -264,7 +286,7 @@ def stogram_source_db():
 def save_stogram_source(path):
     try:
         CACHE_ROOT.mkdir(parents=True, exist_ok=True)
-        STOGRAM_SOURCE_FILE.write_text((path or "").strip(), encoding="utf-8")
+        _atomic_write_text(STOGRAM_SOURCE_FILE, (path or "").strip())
     except Exception:                                 # noqa: BLE001
         pass
 
@@ -314,7 +336,7 @@ def _rehydrate_folder(con, src, folder, row):
                             "display_name": display_name or folder},
                "captions": caps}
     try:
-        (dest_dir / SIDECAR_NAME).write_text(json.dumps(sidecar), encoding="utf-8")
+        _atomic_write_text((dest_dir / SIDECAR_NAME), json.dumps(sidecar))
     except Exception as exc:                          # noqa: BLE001
         return {"ok": False, "note": "could not write sidecar: %s" % exc}
     CAPTIONS.update(caps)                              # live; captions show on reload
@@ -574,7 +596,7 @@ SCAN_FILE = CACHE_ROOT / "scan-progress.json"
 def save_scan_progress(pending):
     try:
         CACHE_ROOT.mkdir(parents=True, exist_ok=True)
-        SCAN_FILE.write_text(json.dumps({"pending": list(pending)}), encoding="utf-8")
+        _atomic_write_text(SCAN_FILE, json.dumps({"pending": list(pending)}))
     except Exception:                                 # noqa: BLE001
         pass
 
@@ -744,7 +766,7 @@ def set_login(name):
     ACTIVE_LOGIN = name
     try:
         CACHE_ROOT.mkdir(parents=True, exist_ok=True)
-        ACCOUNT_FILE.write_text(name, encoding="utf-8")
+        _atomic_write_text(ACCOUNT_FILE, name)
     except Exception:                                 # noqa: BLE001
         pass
     _il["ctx"], _il["tried"] = None, False            # rebuild context as new account
@@ -851,7 +873,7 @@ def load_health():
 def save_health():
     try:
         CACHE_ROOT.mkdir(parents=True, exist_ok=True)
-        HEARTBEAT_FILE.write_text(json.dumps(HEALTH), encoding="utf-8")
+        _atomic_write_text(HEARTBEAT_FILE, json.dumps(HEALTH))
     except Exception:                                 # noqa: BLE001
         pass
 
@@ -878,7 +900,7 @@ def load_identity():
 def save_identity():
     try:
         CACHE_ROOT.mkdir(parents=True, exist_ok=True)
-        IDENTITY_FILE.write_text(json.dumps(IDENTITY), encoding="utf-8")
+        _atomic_write_text(IDENTITY_FILE, json.dumps(IDENTITY))
     except Exception:                                 # noqa: BLE001
         pass
 
@@ -938,7 +960,7 @@ def load_tracking():
 def save_tracking():
     try:
         CACHE_ROOT.mkdir(parents=True, exist_ok=True)
-        TRACKING_FILE.write_text(json.dumps(TRACKING), encoding="utf-8")
+        _atomic_write_text(TRACKING_FILE, json.dumps(TRACKING))
     except Exception:                                 # noqa: BLE001
         pass
 
@@ -955,7 +977,7 @@ def load_hidden():
 def save_hidden():
     try:
         CACHE_ROOT.mkdir(parents=True, exist_ok=True)
-        HIDDEN_FILE.write_text(json.dumps(sorted(HIDDEN)), encoding="utf-8")
+        _atomic_write_text(HIDDEN_FILE, json.dumps(sorted(HIDDEN)))
     except Exception:                                 # noqa: BLE001
         pass
 
@@ -1042,7 +1064,7 @@ def load_dismissed():
 def save_dismissed():
     try:
         CACHE_ROOT.mkdir(parents=True, exist_ok=True)
-        DISMISSED_FILE.write_text(json.dumps(sorted(DISMISSED)), encoding="utf-8")
+        _atomic_write_text(DISMISSED_FILE, json.dumps(sorted(DISMISSED)))
     except Exception:                                 # noqa: BLE001
         pass
 
@@ -1108,7 +1130,7 @@ def load_lists():
 def save_lists():
     try:
         CACHE_ROOT.mkdir(parents=True, exist_ok=True)
-        LISTS_FILE.write_text(json.dumps(LISTS), encoding="utf-8")
+        _atomic_write_text(LISTS_FILE, json.dumps(LISTS))
     except Exception:                                 # noqa: BLE001
         pass
 
@@ -1190,7 +1212,7 @@ def load_merges():
 def save_merges():
     try:
         CACHE_ROOT.mkdir(parents=True, exist_ok=True)
-        MERGES_FILE.write_text(json.dumps(MERGES), encoding="utf-8")
+        _atomic_write_text(MERGES_FILE, json.dumps(MERGES))
     except Exception:                                 # noqa: BLE001
         pass
 
@@ -1586,7 +1608,7 @@ def save_hb_progress():
     try:
         CACHE_ROOT.mkdir(parents=True, exist_ok=True)
         data = {k: HEARTBEAT[k] for k in ("queue", "done", "total")}
-        HEARTBEAT_PROGRESS_FILE.write_text(json.dumps(data), encoding="utf-8")
+        _atomic_write_text(HEARTBEAT_PROGRESS_FILE, json.dumps(data))
     except Exception:                                 # noqa: BLE001
         pass
 
@@ -1858,7 +1880,7 @@ def load_phash():
 def save_phash():
     try:
         CACHE_ROOT.mkdir(parents=True, exist_ok=True)
-        PHASH_FILE.write_text(json.dumps(PHASH), encoding="utf-8")
+        _atomic_write_text(PHASH_FILE, json.dumps(PHASH))
     except Exception:                                 # noqa: BLE001
         pass
 
@@ -2044,9 +2066,9 @@ def seed_stamps(profile):
     for key, ts in newest.items():
         cfg.set(profile, key,
                 datetime.fromtimestamp(ts, timezone.utc).strftime(STAMP_ISO))
-    CACHE_ROOT.mkdir(parents=True, exist_ok=True)
-    with open(STAMPS_FILE, "w") as f:
-        cfg.write(f)
+    buf = io.StringIO()
+    cfg.write(buf)
+    _atomic_write_text(STAMPS_FILE, buf.getvalue())   # atomic: never a half-written stamps file
     job = JOBS.get(profile)               # may be called outside an update job (adopt)
     if job is not None:
         job["log"].append(
@@ -2103,7 +2125,7 @@ def save_refresh():
     try:
         CACHE_ROOT.mkdir(parents=True, exist_ok=True)
         data = {k: REFRESH[k] for k in ("queue", "done", "total", "failed", "paused")}
-        REFRESH_FILE.write_text(json.dumps(data), encoding="utf-8")
+        _atomic_write_text(REFRESH_FILE, json.dumps(data))
     except Exception:                                 # noqa: BLE001
         pass
 
@@ -2727,18 +2749,20 @@ function renameMerge(mid){var v=prompt('Rename merged profile:');if(v===null||!v
  fetch('/merge',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
   body:'action=rename&id='+encodeURIComponent(mid)+'&name='+encodeURIComponent(v.trim())}).then(function(){location.reload();});}
 function buildDedupe(mid){
+ var done='/m/'+encodeURIComponent(mid)+'?dedupe=1&hashed=1';   // hashed=1 = don't auto-rebuild
  fetch('/dedupe-build',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
   body:'id='+encodeURIComponent(mid)}).then(function(r){return r.json();}).then(function(d){
-   if(!d.ok){alert('Could not start hashing: '+(d.note||'unknown'));return;}
-   alert('Hashing images in the background — this can take a while for a large merge. '
-    +'The page will reload into the deduped view when it finishes.');
+   if(!d.ok&&(d.note||'').indexOf('already')<0){alert('Could not start hashing: '+(d.note||'unknown'));return;}
+   var prog=document.getElementById('hashprog');
    var n=0,t=setInterval(function(){n++;
-    if(n>1200){clearInterval(t);location.href='/m/'+encodeURIComponent(mid)+'?dedupe=1';return;}
+    if(n>1800){clearInterval(t);location.href=done;return;}   // hard cap (~60min)
     fetch('/status').then(function(r){return r.json();}).then(function(s){
-     if((s&&s.phash&&s.phash.running))return;
-     clearInterval(t);location.href='/m/'+encodeURIComponent(mid)+'?dedupe=1';
+     var ph=(s&&s.phash)||{};
+     if(ph.running){if(prog){var pct=ph.total?Math.round(100*ph.done/ph.total):0;
+       prog.textContent=ph.done+'/'+ph.total+' ('+pct+'%)';}return;}
+     clearInterval(t);location.href=done;
     }).catch(function(){});
-   },2500);});}
+   },2000);});}
 document.addEventListener('keydown',e=>{if(e.key==='Escape'){var m=document.getElementById('modal');if(m&&m.style.display==='flex')closeModal();}});
 /* ---- Backup & restore ---- */
 function openBackup(){fetch('/backups').then(r=>r.json()).then(d=>{
@@ -3216,7 +3240,7 @@ def render_profile(profile):
     return page(profile, body, js)
 
 
-def _merge_page(m, mid=None, dedupe=False, threshold=14, cap=12):
+def _merge_page(m, mid=None, dedupe=False, threshold=14, cap=12, auto=True):
     """Render a merge's combined omnibus timeline. mid=None means a PREVIEW of an
     uncommitted merge (members passed ad-hoc). dedupe=True collapses near-identical
     images/videos (pHash within `threshold` bits, runaway chains over `cap` left
@@ -3267,9 +3291,11 @@ def _merge_page(m, mid=None, dedupe=False, threshold=14, cap=12):
                      " &nbsp; · %d look-alike group%s left intact (size guard)"
                      % (oversized, "" if oversized == 1 else "s"))
             note = ""
-            if coverage < 0.999:
-                note = (" &nbsp; · only %d%% hashed — <a href='#' onclick=\"buildDedupe('%s');"
-                        "return false\">build full dedupe index</a>"
+            if coverage < 0.999 and auto:
+                note = (" &nbsp; · building dedupe index… <b id='hashprog'>starting…</b>")
+            elif coverage < 0.999:
+                note = (" &nbsp; · %d%% hashed — <a href='#' onclick=\"buildDedupe('%s');"
+                        "return false\">rebuild index</a>"
                         % (int(coverage * 100), me))
             banner = ("<div class='banner'>⧉ <b>Deduped</b> — showing %d of %d posts "
                       "(%d duplicate%s collapsed).%s%s%s</div>"
@@ -3289,6 +3315,10 @@ def _merge_page(m, mid=None, dedupe=False, threshold=14, cap=12):
     preview_js = ("window.__preview=%s;\n"
                   % json.dumps({"name": name, "members": members,
                                 "primary": m.get("primary")})) if preview else ""
+    # auto-build the dedupe index on first open of an under-hashed merge (deduped
+    # by default with no button); hashed=1 in the URL suppresses re-triggering.
+    autohash = mid if (not preview and dedupe and coverage < 0.999 and auto) else ""
+    preview_js += "var _autohash=%s;\n" % json.dumps(autohash)
     # Same windowed grid as a profile, plus a source badge and a ×N dup badge.
     js = (preview_js + "ITEMS=%s;\n"
           "var BATCH=150,shown=0,gfilter='all',_idxs=[];\n"
@@ -3310,14 +3340,15 @@ def _merge_page(m, mid=None, dedupe=False, threshold=14, cap=12):
           "new IntersectionObserver(function(es){es.forEach(function(e){"
           "if(e.isIntersecting)renderMore();});},{rootMargin:'1000px'})"
           ".observe(document.getElementById('sentinel'));\n"
-          "resetGrid();"
+          "resetGrid();\n"
+          "if(_autohash)buildDedupe(_autohash);"
           % json.dumps(data))
     return page(name, body, js)
 
 
-def render_merge(mid, dedupe=False, threshold=14, cap=12):
+def render_merge(mid, dedupe=False, threshold=14, cap=12, auto=True):
     m = MERGES.get(mid)
-    return _merge_page(m, mid, dedupe, threshold, cap) if m else None
+    return _merge_page(m, mid, dedupe, threshold, cap, auto) if m else None
 
 
 def render_merge_preview(name, members, primary):
@@ -3385,7 +3416,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 cap = 12
             b = render_merge(urllib.parse.unquote(path[3:]),
                              dedupe=qs.get("dedupe", ["1"])[0] != "0",
-                             threshold=thr, cap=cap)
+                             threshold=thr, cap=cap,
+                             auto=qs.get("hashed", [""])[0] != "1")
             return self._send(200, b) if b else self._send(404, b"no such merge")
         if path == "/thumb":
             return self.serve_thumb(qs.get("p", [""])[0])

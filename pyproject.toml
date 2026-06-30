@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "offgram"
-version = "0.4.1"
+version = "0.4.2"
 description = "Offline archive browser & viewer companion to instaloader"
 readme = "README.md"
 requires-python = ">=3.9"
