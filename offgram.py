@@ -36,6 +36,7 @@ import math
 import mimetypes
 import os
 import re
+import shlex
 import sqlite3
 import subprocess
 import sys
@@ -2541,6 +2542,7 @@ function validateProfile(p,btn){var card=btn.closest('.card'),old=btn.innerHTML;
    if(typeof gstatus!=='undefined'&&gstatus!=='all')doSearch();  /* drop tile if it left the active filter */
   }).catch(function(){btn.disabled=false;btn.innerHTML=old;alert('Validate request failed.');});}
 var STOGRAM_DB='';   /* remembered source 4K Stogram db path (set per-import, server-persisted) */
+var RESTART_CMD='';  /* command to relaunch this exact instance (shown on shutdown) */
 /* Import menu: pick a metadata source to rehydrate this folder from. 4K Stogram
    is the first source; more can be added as rows here later. */
 function importMenu(p){var dn=escapeHTML(decodeURIComponent(p));
@@ -2798,6 +2800,26 @@ function pollCookieImport(){fetch('/sessions').then(function(r){return r.json();
   var el=document.getElementById('implog');if(el)el.textContent=(d.importlog||[]).join('\\n');
   if(d.importing){setTimeout(pollCookieImport,1500);}
   else if(el){el.textContent+='\\n(done — reloading account list)';setTimeout(openAccounts,900);}});}
+function shutdownServer(){
+ if(!confirm('Shut down the offgram server?\\n\\nThe gallery will stop until you start it again from the terminal.'))return;
+ fetch('/shutdown',{method:'POST'}).catch(function(){});   // server dies mid-response; ignore
+ setTimeout(function(){
+  var cmd=RESTART_CMD||'offgram';
+  document.body.innerHTML='<div style="display:flex;flex-direction:column;align-items:center;'
+   +'justify-content:center;height:100vh;text-align:center;color:#9a9aa3;'
+   +'font:16px/1.6 -apple-system,system-ui,sans-serif;padding:24px;box-sizing:border-box">'
+   +'<div style="font-size:20px;color:#e7e7ea;margin-bottom:6px">offgram has been shut down</div>'
+   +'You can close this tab.<br><br>'
+   +'<div style="font-size:13px">Restart <b>this instance</b> from your terminal:</div>'
+   +'<div style="margin-top:8px;display:flex;gap:8px;align-items:center">'
+   +'<code id="rcmd" style="background:#0e0e10;border:1px solid #2a2a32;border-radius:6px;'
+   +'padding:8px 12px;color:#7fe08a;font:12px/1.4 ui-monospace,Menlo,monospace;'
+   +'user-select:all;max-width:80vw;overflow:auto;white-space:pre">'+escapeHTML(cmd)+'</code>'
+   +'<button onclick="navigator.clipboard&&navigator.clipboard.writeText('+JSON.stringify(cmd)+')" '
+   +'style="background:#1c1c22;border:1px solid #2a2a32;border-radius:6px;color:#c9c9d0;'
+   +'padding:8px 10px;cursor:pointer;font-size:12px">copy</button></div></div>';
+ },500);
+}
 if(document.getElementById('banners'))livePoll();   // index: live banner updates, no reload
 """
 
@@ -3128,7 +3150,9 @@ def render_index():
             "<button class='btn' onclick='toggleSelect()'>▦ select</button>"
             "<button class='btn' onclick='openBackup()'>💾 backup</button>"
             "<button class='btn' onclick='openAccounts()'>⚙ accounts</button>"
-            "<button class='btn' onclick='toggleLog()'>▤ log</button></header>"
+            "<button class='btn' onclick='toggleLog()'>▤ log</button>"
+            "<button class='btn danger' onclick='shutdownServer()' "
+            "title='Cleanly stop the offgram server'>⏻ quit</button></header>"
             "%s<div class='wrap'><div class='addbar' id='addbar'></div>"
             "<div id='selbar'><b id='selcount'>0 selected</b>"
             "<input id='sellist' list='alllists' placeholder='list name…'>"
@@ -3140,8 +3164,9 @@ def render_index():
             % (n_tracked + n_archive, built, acct, legend, scan_banner(),
                refresh_banner(), discover_panel(), "".join(cards)))
     return page("offgram", body,
-                "window.ALL_LISTS=%s;STOGRAM_DB=%s;initLists();"
-                % (json.dumps(lnames), json.dumps(stogram_source_db() or "")))
+                "window.ALL_LISTS=%s;STOGRAM_DB=%s;RESTART_CMD=%s;initLists();"
+                % (json.dumps(lnames), json.dumps(stogram_source_db() or ""),
+                   json.dumps(restart_command())))
 
 
 def render_profile(profile):
@@ -3586,6 +3611,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._send(200 if ok else 400,
                               b'{"ok":true}' if ok else b'{"ok":false}',
                               "application/json")
+        if u.path == "/shutdown":
+            request_shutdown()
+            return self._send(200, b'{"ok":true}', "application/json")
         if u.path == "/refresh":
             action = form.get("action", ["start"])[0]
             if action == "start":
@@ -3759,7 +3787,49 @@ class ThreadingServer(http.server.ThreadingHTTPServer):
     allow_reuse_address = True
 
 
+SERVER = None                                 # set in main(); used by /shutdown
+
+
+def request_shutdown():
+    """Clean shutdown: signal stoppable background jobs, then break serve_forever()
+    from a side thread (after the HTTP response has flushed) so main() returns and
+    the process exits normally rather than being hard-killed."""
+    for job in (REFRESH, HEARTBEAT, IMPORT, PHASHJOB):
+        try:
+            job["stop"] = True
+        except Exception:                     # noqa: BLE001
+            pass
+
+    def _go():
+        time.sleep(0.4)                       # let the /shutdown response reach the browser
+        try:
+            if SERVER is not None:
+                SERVER.shutdown()
+        except Exception:                     # noqa: BLE001
+            pass
+
+    threading.Thread(target=_go, daemon=True).start()
+    print("shutdown requested from UI")
+
+
+def restart_command():
+    """The shell command to relaunch THIS specific instance — its archive, port,
+    and any cache override — shown on the shutdown page so the user can bring this
+    exact server back up."""
+    parts = ["OFFGRAM_COLLECTION=%s" % shlex.quote(str(COLLECTION))]
+    if PORT != 8077:
+        parts.append("OFFGRAM_PORT=%d" % PORT)
+    for var in ("OFFGRAM_CACHE", "OFFGRAM_CACHE_HOME"):
+        if os.environ.get(var):
+            parts.append("%s=%s" % (var, shlex.quote(os.environ[var])))
+    prog = Path(sys.argv[0]).name
+    base = ("python3 %s" % shlex.quote(str(Path(__file__).resolve()))
+            if prog.endswith(".py") else "offgram")
+    return " ".join(parts + [base])
+
+
 def main():
+    global SERVER
     load_db_index()
     mimetypes.add_type("video/mp4", ".mp4")
     load_health()
@@ -3785,14 +3855,16 @@ def main():
     else:
         start_prewarm()                              # warm thumbnails for instaloader profiles
     server = ThreadingServer((HOST, PORT), Handler)
+    SERVER = server
     print("\n  offgram →  http://%s:%d" % (HOST, PORT))
     print("  collection: %s" % ROOT)
     print("  cache:      %s" % INDEX_FILE)
-    print("  (Ctrl-C to stop)\n")
+    print("  (Ctrl-C to stop, or ⏻ quit in the UI)\n")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\nbye")
+        pass
+    print("\nbye")
 
 
 if __name__ == "__main__":
