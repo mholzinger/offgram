@@ -561,6 +561,13 @@ def scan_profile(profile):
                     break
             if rec["cover"]:
                 break
+    last = 0                       # newest item timestamp — drives the "recent" sort
+    for entries in rec["sections"].values():
+        for n, _ in entries:
+            _, t = parse_meta(n)
+            if t > last:
+                last = t
+    rec["last_ts"] = last
     return rec
 
 
@@ -1420,7 +1427,8 @@ BACKUP_DIR = CACHE_ROOT / "backups"
 def backup_paths():
     return [INDEX_FILE, HEARTBEAT_FILE, HEARTBEAT_PROGRESS_FILE, IDENTITY_FILE,
             TRACKING_FILE, HIDDEN_FILE, DISMISSED_FILE, LISTS_FILE, MERGES_FILE,
-            PHASH_FILE, ACCOUNT_FILE, STAMPS_FILE, REFRESH_FILE, SCAN_FILE]
+            PHASH_FILE, ACCOUNT_FILE, STAMPS_FILE, REFRESH_FILE, SCAN_FILE,
+            UPDATES_FILE]
 
 
 def _human_size(n):
@@ -1488,7 +1496,7 @@ def restore_backup(name):
     Snapshots current state first, then extracts whitelisted members by basename
     (no extractall — immune to path traversal) and reloads everything in memory."""
     if (SCAN["running"] or REFRESH["running"] or HEARTBEAT["running"]
-            or QUICK["running"] or any_running()):
+            or QUICK["running"] or UPDSCAN["running"] or any_running()):
         return False, "stop running jobs first (scan / refresh / heartbeat / update)"
     src = (BACKUP_DIR / name if ("/" not in name and "\\" not in name)
            else Path(name).expanduser())
@@ -1541,6 +1549,7 @@ def restore_backup(name):
     load_merges()
     load_phash()
     load_refresh()
+    load_updates()
     ACTIVE_LOGIN = None                                # re-read account.txt lazily
     _il["ctx"], _il["tried"] = None, False
     return True, ("restored %d settings files%s (a safety snapshot of the previous "
@@ -1776,6 +1785,21 @@ def profile_items(profile):
             })
     items.sort(key=lambda x: (x["ts"], x["rel"]), reverse=True)
     return items
+
+
+def profile_last_ts(rec):
+    """Newest item timestamp for an index record. scan_profile stores it, but
+    an index cached by an older version lacks it — computed once and memoized."""
+    ts = rec.get("last_ts")
+    if ts is None:
+        ts = 0
+        for entries in rec.get("sections", {}).values():
+            for fn, _ in entries:
+                _, t = parse_meta(fn)
+                if t > ts:
+                    ts = t
+        rec["last_ts"] = ts
+    return ts
 
 
 # ---------------------------------------------------------------------------
@@ -2091,6 +2115,11 @@ def run_update(profiles):
                 with INDEX_LOCK:
                     INDEX["profiles"][profile] = rec
                 save_index()
+                # the archive caught up — retire a pending "new posts" flag
+                u = UPDATES.get(profile)
+                if u and u.get("new") and rec.get("last_ts", 0) >= (u.get("remote") or 0):
+                    u["new"] = False
+                    save_updates()
             except Exception:                         # noqa: BLE001
                 pass
         except Exception as exc:                       # noqa: BLE001
@@ -2257,6 +2286,118 @@ def any_running():
 
 
 # ---------------------------------------------------------------------------
+# Update scan — a light, throttled live sweep over the tracked accounts that
+# asks Instagram (via the logged-in session) whether each one has posts NEWER
+# than the archive, without downloading anything. Each check is also a health
+# test, so it doubles as a heartbeat pass. Results persist to updates.json and
+# surface as a small "⚡ new posts" tag on the card plus an "updates" filter.
+# ---------------------------------------------------------------------------
+UPDATES_FILE = CACHE_ROOT / "updates.json"
+UPDATES = {}    # folder -> {checked, status, local, remote, media, new, note}
+UPDSCAN = {"running": False, "stop": False, "current": "", "done": 0,
+           "total": 0, "queue": [], "found": 0}
+UPDSCAN_INTERVAL = float(os.environ.get("OFFGRAM_UPDSCAN_INTERVAL", "5"))
+
+
+def load_updates():
+    global UPDATES
+    if UPDATES_FILE.exists():
+        try:
+            UPDATES = json.loads(UPDATES_FILE.read_text(encoding="utf-8"))
+        except Exception:                             # noqa: BLE001
+            UPDATES = {}
+
+
+def save_updates():
+    try:
+        CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+        _atomic_write_text(UPDATES_FILE, json.dumps(UPDATES))
+    except Exception as exc:                          # noqa: BLE001
+        print("warning: could not save updates (%s)" % exc)
+
+
+def updates_new_count():
+    return sum(1 for n, u in UPDATES.items()
+               if u.get("new") and n in INDEX["profiles"]
+               and not is_hidden_profile(n))
+
+
+def update_check_one(name):
+    """One live probe: fetch the profile (which is itself a liveness test —
+    HEALTH is refreshed from it), then peek at its newest post's date and
+    compare against the newest item already archived."""
+    loader = _il_context()
+    now = int(time.time())
+    if loader is None:
+        return {"checked": now, "status": "no-session"}
+    import instaloader
+    try:
+        p = instaloader.Profile.from_username(loader.context, identity_handle(name))
+    except instaloader.ProfileNotExistsException:
+        HEALTH[name] = {"status": "dead", "checked": now}
+        return {"checked": now, "status": "dead", "note": "profile gone"}
+    except Exception as exc:                          # noqa: BLE001
+        return {"checked": now, "status": "error", "note": str(exc)[:120]}
+    status = "private" if p.is_private else "alive"
+    HEALTH[name] = {"status": status, "checked": now, "userid": str(p.userid)}
+    update_identity(name, userid=str(p.userid), username=p.username)
+    out = {"checked": now, "status": status, "media": p.mediacount,
+           "local": profile_last_ts(INDEX["profiles"].get(name) or {})}
+    try:
+        post = next(iter(p.get_posts()), None)        # newest post — one extra API page
+        if post is not None:
+            out["remote"] = int(post.date_utc.replace(
+                tzinfo=timezone.utc).timestamp())
+            out["new"] = out["remote"] > out["local"]
+    except Exception as exc:                          # noqa: BLE001
+        out["note"] = "can't read posts (%s)" % str(exc)[:80]
+    return out
+
+
+def updscan_worker():
+    UPDSCAN["running"], UPDSCAN["stop"] = True, False
+    try:
+        while UPDSCAN["queue"] and not UPDSCAN["stop"]:
+            name = UPDSCAN["queue"][0]
+            UPDSCAN["current"] = name
+            res = update_check_one(name)
+            UPDATES[name] = res
+            if res.get("new"):
+                UPDSCAN["found"] += 1
+            UPDSCAN["queue"].pop(0)
+            UPDSCAN["done"] += 1
+            save_updates()
+            save_health()             # the probe refreshed HEALTH too
+            UPDSCAN["current"] = ""
+            if res.get("status") == "no-session":
+                break                 # nothing will succeed; stop early
+            waited = 0.0              # interruptible throttle wait
+            while waited < UPDSCAN_INTERVAL and not UPDSCAN["stop"] and UPDSCAN["queue"]:
+                time.sleep(0.5)
+                waited += 0.5
+        print("update scan complete" if not UPDSCAN["queue"] else "update scan stopped")
+    finally:
+        UPDSCAN["running"], UPDSCAN["current"] = False, ""
+
+
+def start_updscan(profiles=None):
+    if UPDSCAN["running"]:
+        return False
+    if profiles is None:
+        # least-recently-checked first, so re-running an interrupted sweep
+        # naturally continues with the profiles it never got to
+        profiles = sorted(
+            [n for n in INDEX["profiles"]
+             if not is_archived(n) and not is_hidden_profile(n)
+             and HEALTH.get(n, {}).get("status") != "dead"],
+            key=lambda n: ((UPDATES.get(n) or {}).get("checked", 0), n.lower()))
+    UPDSCAN.update({"queue": list(profiles), "total": len(profiles), "done": 0,
+                    "found": 0, "stop": False})
+    threading.Thread(target=updscan_worker, daemon=True).start()
+    return True
+
+
+# ---------------------------------------------------------------------------
 # HTML
 # ---------------------------------------------------------------------------
 CSS = """
@@ -2293,6 +2434,8 @@ header h1{font-size:17px;margin:0;font-weight:600}
 .actions .btn{padding:4px 9px;font-size:12px}
 .tag{display:inline-block;margin-left:6px;padding:1px 7px;border-radius:10px;
  font-size:11px;background:#2a2a32;color:#9a9aa3;vertical-align:middle}
+.tag.new{background:#12261a;color:#3fb950;border:1px solid #1f4d2e;cursor:pointer}
+.tag.new:hover{background:#173521}
 .legsep{display:inline-block;width:1px;height:14px;background:#2a2a32;margin:0 2px}
 .drow{display:flex;align-items:center;gap:8px;margin-top:8px;flex-wrap:wrap}
 .drow .dn{font-weight:600;min-width:160px}
@@ -2527,7 +2670,7 @@ document.addEventListener('keydown',function(e){
 if(location.search.indexOf('debug=1')>=0&&document.body)leakToggle(true);
 function igName(s){return (s||'').toLowerCase().replace(/^@/,'').replace(/[^a-z0-9._]/g,'');}
 var gstatus='all';
-function filtStatus(el){document.querySelectorAll('.lf').forEach(function(x){x.classList.remove('active');});
+function filtStatus(el){document.querySelectorAll('.lf[data-status]').forEach(function(x){x.classList.remove('active');});
  el.classList.add('active');gstatus=el.dataset.status;
  var db=document.getElementById('deepbtn');
  if(db)db.style.display=(['alive','private','dead','renamed','unchecked'].indexOf(gstatus)>=0)?'':'none';
@@ -2543,12 +2686,31 @@ function matchFilter(c){var hid=c.getAttribute('data-hidden')==='1';
  if(gstatus==='all')return !hid;
  if(gstatus==='hidden')return hid;
  if(hid)return false;
+ if(gstatus==='updates')return c.getAttribute('data-new')==='1';
  if(gstatus==='tracked')return tr==='active';
  if(gstatus==='archive')return tr==='archive';
  if(gstatus.indexOf('list:')===0){var id=gstatus.slice(5);
   return (c.getAttribute('data-lists')||'').split(' ').indexOf(id)>=0;}
  return st===gstatus;}
 function quickCheck(){fetch('/quickcheck',{method:'POST'}).then(function(){setTimeout(livePoll,300);});}
+function updScan(){if(!confirm('Scan every tracked account on Instagram for posts newer than the archive? Nothing is downloaded \\u2014 profiles with updates get a \\u26a1 new-posts tag. Throttled; uses your login session.'))return;
+ updScanCtl('start');}
+function updScanCtl(a){fetch('/updatescan',{method:'POST',
+ headers:{'Content-Type':'application/x-www-form-urlencoded'},
+ body:'action='+a}).then(function(){setTimeout(livePoll,300);});}
+/* ---- Grid sort: alphabetical (server order) or newest archived post first ---- */
+var gsort='name';try{gsort=localStorage.getItem('og_sort')||'name';}catch(e){}
+function setSort(el){gsort=el.dataset.sort;try{localStorage.setItem('og_sort',gsort);}catch(e){}
+ applySortUI();sortGrid();}
+function applySortUI(){document.querySelectorAll('.lf[data-sort]').forEach(function(x){
+ x.classList.toggle('active',x.dataset.sort===gsort);});}
+function sortGrid(){var g=document.querySelector('.grid');if(!g)return;
+ var cards=Array.prototype.slice.call(g.querySelectorAll('.card'));
+ cards.forEach(function(c,i){if(!c.dataset.oidx)c.dataset.oidx=String(i);});  /* remember server order once */
+ cards.sort(function(a,b){
+  if(gsort==='recent'){var d=(+b.dataset.ts||0)-(+a.dataset.ts||0);if(d)return d;}
+  return (+a.dataset.oidx)-(+b.dataset.oidx);});
+ cards.forEach(function(c){g.appendChild(c);});}
 var HCOLOR={alive:'#3fb950','private':'#d29922',dead:'#f85149',renamed:'#539bf5',error:'#8b949e','no-session':'#8b949e'};
 function validateProfile(p,btn){var card=btn.closest('.card'),old=btn.innerHTML;
  btn.disabled=true;btn.textContent='⏳ …';
@@ -2711,18 +2873,30 @@ function assignSelected(){var name=(document.getElementById('sellist').value||''
  postLists({action:'assign',name:name,folders:JSON.stringify(folders)});}
 /* ---- Merge: squash several profiles into one combined timeline ---- */
 function mergeSelected(){
- var folders=[];document.querySelectorAll('.card .sel:checked').forEach(function(c){
+ var infos=[];document.querySelectorAll('.card .sel:checked').forEach(function(c){
   var card=c.closest('.card');
-  if(card&&card.getAttribute('data-merge')!=='1')folders.push(decodeURIComponent(card.getAttribute('data-folder')));});
+  if(card&&card.getAttribute('data-merge')!=='1')infos.push({
+   f:decodeURIComponent(card.getAttribute('data-folder')),
+   st:card.getAttribute('data-status')||'unchecked',
+   ts:parseInt(card.getAttribute('data-ts')||'0',10)||0});});
+ var folders=infos.map(function(i){return i.f;});
  if(folders.length<2){alert('Select at least two profiles to merge.');return;}
  window.__mergeFolders=folders;
- var opts=folders.map(function(f){return '<option value="'+escapeAttr(f)+'">'+escapeHTML(f)+'</option>';}).join('');
+ /* Default parent: prefer a LIVE account (public/alive or private), most
+    recently active first; fall back to the most recently active overall. */
+ infos.sort(function(a,b){return b.ts-a.ts;});
+ var live=infos.filter(function(i){return i.st==='alive'||i.st==='private';});
+ var best=(live[0]||infos[0]).f;
+ var opts=infos.map(function(i){
+  var label=i.f+(i.ts?' \\u00b7 '+new Date(i.ts*1000).toISOString().slice(0,10):'')+' \\u00b7 '+i.st;
+  return '<option value="'+escapeAttr(i.f)+'"'+(i.f===best?' selected':'')+'>'+escapeHTML(label)+'</option>';}).join('');
  openModal('<h3>Merge '+folders.length+' profiles</h3>'
   +'<div class="sub" style="margin-bottom:10px">'+folders.map(escapeHTML).join(', ')+'</div>'
   +'<label class="lrow"><input type="radio" name="mmode" value="new" checked onchange="mmodeUI()"> New merged profile</label>'
   +'<div class="newrow" id="mnewrow"><input id="mnewname" placeholder="merged profile name…"></div>'
   +'<label class="lrow"><input type="radio" name="mmode" value="parent" onchange="mmodeUI()"> Merge into a parent (uses its name &amp; cover)</label>'
-  +'<div class="newrow" id="mparrow" style="display:none"><select id="mparent">'+opts+'</select></div>'
+  +'<div class="newrow" id="mparrow" style="display:none"><select id="mparent">'+opts+'</select>'
+  +'<div class="sub" style="margin-top:6px">pre-selected: the live (public/private) account with the newest post</div></div>'
   +'<div class="mbtns"><button class="btn go" onclick="previewMerge()">👁 preview</button>'
   +'<button class="btn" onclick="closeModal()">cancel</button></div>');}
 function mmodeUI(){var p=document.querySelector('input[name=mmode]:checked').value;
@@ -2946,6 +3120,17 @@ def heartbeat_banner():
             % (HEARTBEAT["done"], HEARTBEAT["total"], pct, state, cur, ctl))
 
 
+def updscan_banner():
+    if not UPDSCAN["running"]:
+        return ""
+    pct = int(100 * UPDSCAN["done"] / UPDSCAN["total"]) if UPDSCAN["total"] else 0
+    cur = (" · now <b>@%s</b>" % html.escape(UPDSCAN["current"])) if UPDSCAN["current"] else ""
+    return ("<div class='banner'>⚡ Scanning live accounts for new posts — "
+            "%d/%d (%d%%) · <b>%d</b> with updates%s &nbsp; "
+            "<button class='btn' onclick=\"updScanCtl('stop')\">■ stop</button></div>"
+            % (UPDSCAN["done"], UPDSCAN["total"], pct, UPDSCAN["found"], cur))
+
+
 def quick_check_banner():
     if not QUICK["running"]:
         return ""
@@ -3060,9 +3245,22 @@ def render_index():
         if merged:
             tag += ("<a class='tag' href='/m/%s' title='Part of a merge'>⤳ merged</a>"
                     % urllib.parse.quote(midof))
+        last_ts = profile_last_ts(rec)
+        upd_info = UPDATES.get(name) or {}
+        has_new = bool(upd_info.get("new")) and not hid
+        if has_new:
+            dfmt = lambda t: (time.strftime("%Y-%m-%d", time.localtime(t))
+                              if t else "?")
+            tag += ("<span class='tag new' onclick=\"upd('%s')\" "
+                    "title='Instagram has posts newer than the archive — "
+                    "newest there %s, newest here %s (checked %s). "
+                    "Click to update now.'>⚡ new posts</span>"
+                    % (pe, dfmt(upd_info.get("remote")), dfmt(upd_info.get("local")),
+                       dfmt(upd_info.get("checked"))))
         cards.append(
             "<div class='card' data-name='%s' data-folder='%s' data-status='%s' "
-            "data-track='%s' data-hidden='%s' data-lists='%s' data-merged='%s'>"
+            "data-track='%s' data-hidden='%s' data-lists='%s' data-merged='%s' "
+            "data-ts='%d' data-new='%s'>"
             "<input type='checkbox' class='sel' onclick='selChanged()'>"
             "<a class='thumb' href='/p/%s'>%s"
             "<span class='badge'>%d</span></a><div class='meta'>"
@@ -3071,7 +3269,7 @@ def render_index():
             % (html.escape(searchkey), pe,
                ((HEALTH.get(name) or {}).get("status") or "unchecked"),
                "archive" if arch else "active", "1" if hid else "0", lidx,
-               "1" if merged else "0",
+               "1" if merged else "0", last_ts, "1" if has_new else "0",
                pe, img, rec["total"], health_dot(HEALTH.get(name)),
                disp, html.escape(bits or "empty"), tag, actions))
     merge_cards = []
@@ -3087,15 +3285,16 @@ def render_index():
                else "<div class='play'>▦</div>")
         nm = m.get("name") or mid
         skey = (nm + " " + " ".join(members)).lower()
+        mts = max(profile_last_ts(INDEX["profiles"][f]) for f in members)
         actions = (("<a class='btn go' href='/m/%s'>↗ open</a>" % me)
                    + ("<button class='btn' onclick=\"renameMerge('%s')\">✎ rename</button>" % me)
                    + ("<button class='btn' onclick=\"unmerge('%s')\">✕ unmerge</button>" % me))
         merge_cards.append(
-            "<div class='card mergecard' data-name='%s' data-merge='1'>"
+            "<div class='card mergecard' data-name='%s' data-merge='1' data-ts='%d'>"
             "<a class='thumb' href='/m/%s'>%s<span class='badge'>%d</span></a>"
             "<div class='meta'><b>⤳ %s</b><div class='s2'>%d accounts</div>"
             "<div class='actions'>%s</div></div></div>"
-            % (html.escape(skey), me, img, merge_total(m),
+            % (html.escape(skey), mts, me, img, merge_total(m),
                html.escape(nm), len(members), actions))
     cards = merge_cards + cards
     built = time.strftime("%Y-%m-%d %H:%M", time.localtime(INDEX.get("built", 0)))
@@ -3129,6 +3328,12 @@ def render_index():
             lf("list:%d" % i, "🗂 " + html.escape(L), "",
                sum(1 for f in LISTS[L] if f in INDEX["profiles"]))
             for i, L in enumerate(lnames))
+    n_updates = updates_new_count()
+    sortchips = ("<span class='legsep'></span>"
+                 "<span style='color:#6e7681'>sort</span>"
+                 "<span class='lf' data-sort='name' onclick='setSort(this)'>name</span>"
+                 "<span class='lf' data-sort='recent' onclick='setSort(this)' "
+                 "title='Newest archived post first'>↓ recent</span>")
     legend = ("<div class='legend'>"
               + lf("all", "all", "")
               + lf("alive", "alive", sw("#3fb950"))
@@ -3140,9 +3345,11 @@ def render_index():
               + lf("tracked", "↻ tracked", "", n_tracked)
               + lf("archive", "⊘ archive", "", n_archive)
               + lf("hidden", "✕ hidden", "", n_hidden)
+              + (lf("updates", "⚡ new posts", "", n_updates) if n_updates else "")
               + (lf("merges", "⤳ merges", "", len(MERGES)) if MERGES else "")
               + (lf("merged", "⤳ merged-in", "", len(mm)) if mm else "")
               + listchips
+              + sortchips
               + "<button class='btn' id='deepbtn' style='display:none' "
               "onclick='deepCheck()'>🔬 deep-check filtered (authenticated)</button>"
               + "<span style='margin-left:auto;color:#6e7681'>click to filter · "
@@ -3165,6 +3372,8 @@ def render_index():
             "<span class='sub'>as</span>%s"
             "<button class='btn' onclick='quickCheck()'>⚡ Quick check</button>"
             "<button class='btn' onclick='heartbeat()'>♥ Check all</button>"
+            "<button class='btn' onclick='updScan()' title='Check live accounts "
+            "for posts newer than the archive — no download'>⚡ scan updates</button>"
             "<button class='btn' onclick='rescan()'>⟳ rescan</button>"
             "<button class='btn' onclick='importAll()' "
             "title='Idempotently rehydrate every folder that matches a 4K Stogram db'>"
@@ -3189,6 +3398,7 @@ def render_index():
                refresh_banner(), discover_panel(), "".join(cards)))
     return page("offgram", body,
                 "window.ALL_LISTS=%s;STOGRAM_DB=%s;RESTART_CMD=%s;initLists();"
+                "applySortUI();sortGrid();"
                 % (json.dumps(lnames), json.dumps(stogram_source_db() or ""),
                    json.dumps(restart_command())))
 
@@ -3430,10 +3640,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/banners":
             payload = {"html": (scan_banner() + quick_check_banner()
                                 + import_banner() + phash_banner()
-                                + heartbeat_banner() + refresh_banner()),
+                                + heartbeat_banner() + updscan_banner()
+                                + refresh_banner()),
                        "active": (SCAN["running"] or REFRESH["running"]
                                   or HEARTBEAT["running"] or QUICK["running"]
-                                  or IMPORT["running"] or PHASHJOB["running"])}
+                                  or IMPORT["running"] or PHASHJOB["running"]
+                                  or UPDSCAN["running"])}
             return self._send(200, json.dumps(payload).encode(), "application/json")
         if path == "/status":
             with JOBS_LOCK:
@@ -3445,6 +3657,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                        "scan": dict(SCAN), "prewarm": dict(PREWARM),
                        "heartbeat": dict(HEARTBEAT), "refresh": refresh_snapshot(),
                        "import": dict(IMPORT), "phash": dict(PHASHJOB),
+                       "updscan": {k: v for k, v in UPDSCAN.items()
+                                   if k != "queue"},
                        "jobs": jobs_payload}
             return self._send(200, json.dumps(payload).encode(), "application/json")
         if path == "/backups":
@@ -3512,6 +3726,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._send(200, b'{"ok":true}', "application/json")
         if u.path == "/quickcheck":
             start_quickcheck()
+            return self._send(200, b'{"ok":true}', "application/json")
+        if u.path == "/updatescan":
+            action = form.get("action", ["start"])[0]
+            if action == "stop":
+                UPDSCAN["stop"] = True
+                UPDSCAN["queue"] = []
+            elif not UPDSCAN["running"]:
+                start_updscan()
             return self._send(200, b'{"ok":true}', "application/json")
         if u.path == "/validate":
             # One-off per-tile check: liveness + name-history for a single folder.
@@ -3876,6 +4098,7 @@ def main():
     load_merges()
     load_phash()
     load_refresh()
+    load_updates()
     have_cache = load_index()
     pending = [p for p in load_scan_pending() if (ROOT / p).is_dir()]
     if not have_cache:

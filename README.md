@@ -23,6 +23,7 @@ It's a single dependency-free Python file (standard library only). The archive c
 - **Ephemeral capture** — updates also pull **stories, highlights, and reels** in separate passes, each routed into its own section subfolder
 - **Add a new profile** — type an un-archived `@name` in the search box and hit **Archive @name**
 - **⟲ Refresh all** runs a slow, resumable, throttle-aware whole-archive refresh in the background; skips dead and archive-only accounts
+- **⚡ scan updates** — a throttled live sweep that asks Instagram whether each tracked account has posts **newer than your archive**, *without downloading anything*. Profiles with news get a clickable **⚡ new posts** tag (click = update just that one) and a **⚡ new posts** filter chip; each probe doubles as a health check
 
 **Accounts & sessions**
 - An **"as @account"** switcher in the header picks the active instaloader session (used for updates and the authenticated heartbeat); the choice persists across restarts
@@ -35,7 +36,7 @@ It's a single dependency-free Python file (standard library only). The archive c
 
 **Merge accounts into one timeline**
 - **▦ select** several profiles from the same creator (an abandoned one, a revived one, a banned one…) and **⤳ merge…** them
-- Name a **new merged profile**, or designate a **parent** (its handle and cover lead)
+- Name a **new merged profile**, or designate a **parent** (its handle and cover lead) — the parent picker **pre-selects the live (public/private) account with the newest post**, with all candidates listed newest-first
 - **👁 Preview** the combined timeline *before committing* — nothing is saved until you confirm
 - The **omnibus view** stitches every member's posts into one contiguous, time-sorted timeline, each post badged with its source account (🏷 toggle)
 - **Near-duplicate dedup** — the same photo re-uploaded across accounts (Instagram re-encodes it each time, so files differ) is detected by **perceptual hash** and collapsed to a single cell carrying *every* copy's caption/date/account. Always keeps at least the best-quality copy
@@ -54,7 +55,8 @@ It's a single dependency-free Python file (standard library only). The archive c
 - **Lists** — user-named groups (tags); an account can be on several. Create/rename/delete via **🗂 lists**, tag one from its per-card **🗂**, or **▦ select** several and bulk-assign. Each list becomes a filter chip
 - **Discovery** — folders that appear on disk but aren't tracked get a **🆕 new folders** banner; adopt one to deep-scan it, seed incremental-update stamps, and register its identity — or ignore it (stale ignores self-prune when a folder is gone)
 - **⟳ rescan** waits for the scan to finish and then reports exactly what changed (`+N new, −M removed`)
-- Filter the grid by **status · tracking · list · ⤳ merges** chips; search works within any active filter
+- Filter the grid by **status · tracking · list · ⚡ new posts · ⤳ merges** chips; search works within any active filter
+- **Sort** the grid by **name** or **↓ recent** (newest archived post first — great for "what moved lately" across tracked profiles); the choice is remembered
 
 **Back up**
 - **💾 backup** snapshots every offgram setting — lists, identity/renames, tracking, hidden, dismissed, health, merges, dedup hashes, latest-stamps, the index, and your `config.py` — into a timestamped `.tar.gz` under `~/.cache/offgram/backups/` (login sessions excluded). Restore from the list (snapshots current state first, reloads in place)
