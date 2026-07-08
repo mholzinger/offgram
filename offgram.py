@@ -25,7 +25,7 @@ Design notes:
     thumbnails from them. A pure instaloader archive never uses any of this.
 """
 
-__version__ = "0.5.2"        # single source of truth — pyproject reads this
+__version__ = "0.5.3"        # single source of truth — pyproject reads this
 
 import configparser
 import hashlib
@@ -125,6 +125,21 @@ def _load_config():
             try:
                 spec.loader.exec_module(mod)
             except Exception as exc:                  # noqa: BLE001
+                head = ""
+                try:
+                    head = p.read_text(encoding="utf-8", errors="replace")[:4000].lower()
+                except Exception:                     # noqa: BLE001
+                    pass
+                if "<html" in head or "<!doctype" in head or "<div" in head:
+                    raise SystemExit(
+                        "offgram: %s is a saved WEB PAGE, not a config file.\n\n"
+                        "It looks like config.example.py was saved from the GitHub "
+                        "page in a browser\n(that saves the whole page as HTML). "
+                        "Instead, make a plain text file containing just:\n\n"
+                        '    COLLECTION = "/path/to/your/instagram/archive"\n'
+                        '    INSTALOADER_LOGIN = ""\n\n'
+                        "(or on GitHub press the 'Raw' button before saving)."
+                        % p) from None
                 raise SystemExit(
                     "offgram: could not read config file %s\n  %s: %s\n\n"
                     "The config must be PLAIN PYTHON — no HTML, CSS, or rich text.\n"
@@ -140,7 +155,48 @@ def _load_config():
     return collection, login
 
 
+def _first_run_setup():
+    """No config anywhere and we're on an interactive terminal: ask for the
+    archive path and write ~/.config/offgram/config.py ourselves. Returns the
+    collection path, or "" if the user bailed."""
+    global CONFIG_PATH
+    print("\nWelcome to offgram! One thing is needed: the path to your Instagram")
+    print("archive — a folder containing one subfolder per profile (as created")
+    print("by 4K Stogram or instaloader).\n")
+    for _ in range(3):
+        try:
+            raw = input("Archive folder path (blank to quit): ")
+        except (EOFError, KeyboardInterrupt):
+            return ""
+        # tolerate quotes and Finder drag-and-drop escapes
+        raw = raw.strip().strip("'\"").replace("\\ ", " ").strip()
+        if not raw:
+            return ""
+        path = Path(raw).expanduser()
+        if path.is_dir():
+            cfg_dir = Path.home() / ".config" / "offgram"
+            cfg_dir.mkdir(parents=True, exist_ok=True)
+            cfg = cfg_dir / "config.py"
+            cfg.write_text(
+                "# offgram config — written by first-run setup. Plain Python only.\n"
+                "COLLECTION = %r\n"
+                'INSTALOADER_LOGIN = ""   # or an instaloader session username\n'
+                % str(path), encoding="utf-8")
+            CONFIG_PATH = cfg
+            print("\nSaved to %s — edit it any time.\n" % cfg)
+            return str(path)
+        print("  that's not a folder: %s" % path)
+    return ""
+
+
 _collection, INSTALOADER_LOGIN = _load_config()
+if not _collection and CONFIG_PATH is None:
+    try:
+        _interactive = sys.stdin is not None and sys.stdin.isatty()
+    except Exception:                                 # noqa: BLE001
+        _interactive = False
+    if _interactive:
+        _collection = _first_run_setup()
 if not _collection:
     raise SystemExit(
         "offgram: no collection configured. Set $OFFGRAM_COLLECTION, or create "
@@ -2547,6 +2603,8 @@ body.hidesrc .srctag{display:none}
 #lb .stage{flex:1;min-height:0;width:100%;display:flex;
  align-items:center;justify-content:center}
 #lb .stage img,#lb .stage video{max-width:96vw;max-height:100%;display:block}
+#lb .stage .miss{max-width:560px;margin:auto;text-align:center;color:#e7e7ea;
+ font-size:15px;line-height:1.7;padding:24px}
 #lb .cap{flex:none;width:100%;max-height:24vh;overflow:auto;box-sizing:border-box;
  padding:10px 18px;background:rgba(0,0,0,.55);white-space:pre-wrap}
 #lb .nav{position:fixed;top:50%;font-size:40px;color:#fff;cursor:pointer;
@@ -2577,6 +2635,12 @@ function renderLB(){let it=ITEMS[cur];let s=document.querySelector('#lb .stage')
  s.innerHTML=it.kind==='video'
   ?'<video src="'+m+'" controls autoplay playsinline'+(MUTED?' muted':'')+'></video>'
   :'<img src="'+m+'">';
+ var m0=s.querySelector('img,video');
+ if(m0)m0.onerror=function(){s.innerHTML='<div class="miss">⚠ Could not load this file from the archive'
+  +'<br><span class="sub">'+escapeHTML(it.rel)+'</span>'
+  +'<br><span class="sub">The thumbnail is cached, but the original file is missing or unreadable — '
+  +'disconnected drive, moved folder, or a cloud placeholder not downloaded yet. '
+  +'The offgram terminal shows the exact reason.</span></div>';};
  if(it.kind==='video'){var v=s.querySelector('video');if(v)v.muted=MUTED;}
  applyMuteBtn(it.kind==='video');
  let when=it.ts?new Date(it.ts*1000).toLocaleString():'';
@@ -2662,7 +2726,9 @@ function livePoll(){
    if(b&&d.html!==_liveHTML){b.innerHTML=d.html;_liveHTML=d.html;}  // touch DOM only on change
    if(d.active){setTimeout(tick,4000);}
    else{_liveLoop=false;
-        if(document.querySelectorAll('.card').length===0)location.reload();}
+        /* only the "indexing…" placeholder reloads into the real grid; a page
+           that merely has no cards must never reload-loop */
+        if(document.getElementById('idxwait'))location.reload();}
   }).catch(function(){_liveLoop=false;});   // release guard so a later action can restart
  })();
 }
@@ -3223,8 +3289,11 @@ def render_index():
     with INDEX_LOCK:
         profiles = sorted(INDEX["profiles"].items(), key=lambda kv: kv[0].lower())
     if not profiles and SCAN["running"]:
+        # id='idxwait' marks this placeholder — livePoll reloads ONLY this page
+        # when the scan finishes (a real, empty grid must never reload-loop)
         body = ("<header><h1>offgram</h1><span class='sp'></span></header>"
-                "<div class='wrap'><div id='banners'>%s</div></div>" % scan_banner())
+                "<div class='wrap' id='idxwait'><div id='banners'>%s</div></div>"
+                % scan_banner())
         return page("indexing…", body)
     lnames = list_names()
     mm = merged_members()
@@ -4032,11 +4101,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return self._send(200, t.read_bytes(), ctype, {"Cache-Control": "max-age=86400"})
 
     def serve_media(self, rel):
-        full = safe_under_root(urllib.parse.unquote(rel))
-        if not full or not full.is_file():
+        rel = urllib.parse.unquote(rel)
+        full = safe_under_root(rel)
+        if not full:
+            print("media not found: %s (outside archive root)" % rel)
             return self._send(404, b"not found")
+        try:
+            if not full.is_file():
+                print("media not found: %s (looked at %s)" % (rel, full))
+                return self._send(404, b"not found")
+        except OSError as exc:                        # unreachable mount, etc.
+            print("media unreadable: %s (%s)" % (rel, exc))
+            return self._send(404, b"unreadable")
         ctype = mimetypes.guess_type(str(full))[0] or "application/octet-stream"
-        size = full.stat().st_size
+        try:
+            size = full.stat().st_size
+        except OSError as exc:
+            print("media unreadable: %s (%s)" % (rel, exc))
+            return self._send(404, b"unreadable")
         rng = self.headers.get("Range")
         if rng and rng.startswith("bytes="):
             try:

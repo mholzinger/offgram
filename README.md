@@ -95,7 +95,9 @@ pip install -e .
 
 ## Configure
 
-Create `~/.config/offgram/config.py` (copy from [`config.example.py`](config.example.py)):
+**Easiest: just run `offgram`.** With no config present it asks for your archive path and writes `~/.config/offgram/config.py` for you.
+
+Or create `~/.config/offgram/config.py` by hand (copy from [`config.example.py`](config.example.py) — if you grab it from GitHub in a browser, use the **Raw** button; saving the page itself gives you HTML, which isn't a valid config):
 
 ```python
 COLLECTION = "/path/to/your/instagram/archive"   # folder of per-profile subfolders
@@ -157,6 +159,10 @@ OFFGRAM_COLLECTION=/tmp/test-archive OFFGRAM_PORT=8079 offgram
 ```
 
 Use `OFFGRAM_CACHE` to pin an explicit cache directory, or `OFFGRAM_CACHE_HOME` to relocate the base that holds the per-archive dirs.
+
+### Start fresh / reset
+
+All of offgram's state lives in its cache, never in your archive. To reset completely: quit the app (**⏻** or Ctrl-C), `rm -rf ~/.cache/offgram`, relaunch — it rescans from the files on disk, and your archive is untouched. A leftover background refresh queue from a previous run shows up as a banner with **▶ resume / ■ clear** buttons; **■ clear** drops it.
 
 ### Diagnostics
 
