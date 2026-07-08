@@ -102,10 +102,14 @@ COLLECTION = "/path/to/your/instagram/archive"   # folder of per-profile subfold
 INSTALOADER_LOGIN = "your_ig_username"           # session for updates/heartbeat, or ""
 ```
 
+The config is **plain Python** — just `NAME = "value"` lines. (Pasting HTML/CSS or rich text into it stops offgram at startup with a pointer to the bad line.)
+
 Create the instaloader session the update buttons and heartbeat use (one time per account):
 
 ```bash
 instaloader --login YOUR_USERNAME
+# pipx install? the CLI lives inside offgram's venv, not on your PATH:
+~/.local/pipx/venvs/offgram/bin/instaloader --login YOUR_USERNAME
 ```
 
 Add more accounts the same way — they appear in the in-app account switcher. Or skip the CLI entirely: in the running app, **⚙ accounts → import** pulls a session straight from a logged-in browser (`--load-cookies`), no password or 2FA required. Browser import needs the optional `browser_cookie3` package (`pip install browser_cookie3`); **Firefox or Chrome are the most reliable** — Safari cookie access is flaky on macOS.
@@ -125,14 +129,17 @@ Add more accounts the same way — they appear in the in-app account switcher. O
 | `OFFGRAM_EPHEMERAL` | `1` | grab stories/highlights/reels on update (`0` = posts only) |
 | `OFFGRAM_PASS_DELAY` | `6` | seconds between instaloader passes (throttle protection) |
 | `OFFGRAM_HEARTBEAT_INTERVAL` | `4` | seconds between heartbeat checks |
+| `OFFGRAM_UPDSCAN_INTERVAL` | `5` | seconds between ⚡ update-scan probes |
+| `OFFGRAM_NO_BROWSER` | — | set to `1` to skip auto-opening the browser on start |
 
 ## Run
 
 ```bash
 offgram                    # if pipx-installed
 # or:  python3 offgram.py  # from a checkout
-# then open http://localhost:8077
 ```
+
+Your browser opens to `http://localhost:8077` automatically (set `OFFGRAM_NO_BROWSER=1` to skip, e.g. on a headless box).
 
 First launch scans the collection in the background (slower the first time; cached forever after). Hit **⟳ rescan** after large external changes; per-profile **↻ update** re-scans that profile automatically when instaloader finishes. Stop the server cleanly from the UI with **⏻ quit** (or Ctrl-C in the terminal) — the shutdown page shows the exact command to relaunch *that* instance.
 

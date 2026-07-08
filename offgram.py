@@ -97,8 +97,19 @@ def _load_config():
             CONFIG_PATH = p
             spec = importlib.util.spec_from_file_location("offgram_user_config", p)
             mod = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(mod)
-            collection = collection or str(getattr(mod, "COLLECTION", "") or "")
+            try:
+                spec.loader.exec_module(mod)
+            except Exception as exc:                  # noqa: BLE001
+                raise SystemExit(
+                    "offgram: could not read config file %s\n  %s: %s\n\n"
+                    "The config must be PLAIN PYTHON — no HTML, CSS, or rich text.\n"
+                    "It only needs (copy config.example.py and edit the values):\n\n"
+                    '    COLLECTION = "/path/to/your/instagram/archive"\n'
+                    '    INSTALOADER_LOGIN = ""\n'
+                    % (p, type(exc).__name__, exc)) from None
+            # COLLECTIONS accepted as a common typo for COLLECTION
+            collection = collection or str(getattr(mod, "COLLECTION", "")
+                                           or getattr(mod, "COLLECTIONS", "") or "")
             login = login or str(getattr(mod, "INSTALOADER_LOGIN", "") or "")
             break
     return collection, login
@@ -4111,10 +4122,20 @@ def main():
         start_prewarm()                              # warm thumbnails for instaloader profiles
     server = ThreadingServer((HOST, PORT), Handler)
     SERVER = server
-    print("\n  offgram →  http://%s:%d" % (HOST, PORT))
+    url = "http://%s:%d" % (HOST, PORT)
+    print("\n  offgram →  %s" % url)
     print("  collection: %s" % ROOT)
     print("  cache:      %s" % INDEX_FILE)
     print("  (Ctrl-C to stop, or ⏻ quit in the UI)\n")
+    if os.environ.get("OFFGRAM_NO_BROWSER", "") not in ("1", "true", "yes"):
+        def _open_browser():
+            time.sleep(1.0)                      # let serve_forever start listening
+            try:
+                import webbrowser
+                webbrowser.open(url)
+            except Exception:                    # noqa: BLE001
+                pass                             # headless box — the printed URL stands
+        threading.Thread(target=_open_browser, daemon=True).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
