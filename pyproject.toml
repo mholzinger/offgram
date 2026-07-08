@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "offgram"
-version = "0.5.1"
+dynamic = ["version"]
 description = "Offline archive browser & viewer companion to instaloader"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -34,3 +34,8 @@ offgram = "offgram:main"
 
 [tool.setuptools]
 py-modules = ["offgram"]
+
+[tool.setuptools.dynamic]
+# Read statically from the module's `__version__` literal (no import happens),
+# so offgram.py stays the single place a release bump is made.
+version = { attr = "offgram.__version__" }

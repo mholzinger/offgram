@@ -25,6 +25,8 @@ Design notes:
     thumbnails from them. A pure instaloader archive never uses any of this.
 """
 
+__version__ = "0.5.2"        # single source of truth — pyproject reads this
+
 import configparser
 import hashlib
 import html
@@ -49,6 +51,29 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
+
+
+GITHUB_URL = "https://github.com/mholzinger/offgram"
+
+
+def _git_commit():
+    """Short commit hash when running from a git checkout of offgram; "" when
+    installed (pipx/pip) or run as a bare downloaded script."""
+    d = str(Path(__file__).resolve().parent)
+    try:
+        tracked = subprocess.run(
+            ["git", "-C", d, "ls-files", "--error-unmatch", "offgram.py"],
+            capture_output=True, timeout=3).returncode == 0
+        if not tracked:                # inside some *other* repo — not our hash
+            return ""
+        out = subprocess.run(["git", "-C", d, "rev-parse", "--short", "HEAD"],
+                             capture_output=True, text=True, timeout=3)
+        return out.stdout.strip() if out.returncode == 0 else ""
+    except Exception:                                 # noqa: BLE001
+        return ""
+
+
+GIT_COMMIT = _git_commit()
 
 
 def _atomic_write_text(path, text):
@@ -2420,6 +2445,9 @@ header{position:sticky;top:0;z-index:10;background:#16161a;
  border-bottom:1px solid #26262c;padding:12px 18px;display:flex;
  align-items:center;gap:10px;flex-wrap:wrap}
 header h1{font-size:17px;margin:0;font-weight:600}
+.ver{font-size:11px;color:#6e7681;white-space:nowrap;margin-left:-4px}
+.ver a{color:#6e7681}
+.ver a:hover{color:#7db4ff}
 #search{background:#0e0e10;border:1px solid #3a3a44;color:#e7e7ea;padding:6px 10px;
  border-radius:7px;font-size:13px;width:210px}
 #search:focus{outline:none;border-color:#2c5fb3}
@@ -3375,7 +3403,13 @@ def render_index():
                 "onchange='switchAcct()'>%s</select>" % opts)
     else:
         acct = "<span class='sub'>no login</span>"
-    body = ("<header><h1>offgram</h1>"
+    verchip = ("<span class='ver'><a href='%s/releases/tag/v%s' target='_blank' "
+               "title='Release notes'>v%s</a>%s</span>"
+               % (GITHUB_URL, __version__, __version__,
+                  (" · <a href='%s/commit/%s' target='_blank' "
+                   "title='Git commit this instance is running'>%s</a>"
+                   % (GITHUB_URL, GIT_COMMIT, GIT_COMMIT)) if GIT_COMMIT else ""))
+    body = ("<header><h1>offgram</h1>" + verchip +
             "<input id='search' placeholder='search, or type @name to add…' "
             "oninput='doSearch()' onkeydown='if(event.key===&quot;Enter&quot;)addSearched()'>"
             "<span class='sub'>%d profiles · indexed %s</span>"
@@ -4123,7 +4157,8 @@ def main():
     server = ThreadingServer((HOST, PORT), Handler)
     SERVER = server
     url = "http://%s:%d" % (HOST, PORT)
-    print("\n  offgram →  %s" % url)
+    print("\n  offgram v%s%s →  %s"
+          % (__version__, (" (%s)" % GIT_COMMIT) if GIT_COMMIT else "", url))
     print("  collection: %s" % ROOT)
     print("  cache:      %s" % INDEX_FILE)
     print("  (Ctrl-C to stop, or ⏻ quit in the UI)\n")
