@@ -143,6 +143,17 @@ offgram                    # if pipx-installed
 
 Your browser opens to `http://localhost:8077` automatically (set `OFFGRAM_NO_BROWSER=1` to skip, e.g. on a headless box).
 
+**Button cheat-sheet** (also in-app via **❓**): *rescan* reads your disk; *checks/scans* ask Instagram without downloading; *update/refresh* download new content.
+
+| Button | What it does | Needs login? |
+|---|---|---|
+| ⚡ Quick check | fast anonymous "is this account still visible?" triage | no |
+| ♥ Check all | deep health check: alive · private · dead · renamed dots | yes |
+| ⚡ scan updates | flags accounts with posts newer than your archive (no download) | yes |
+| ⟳ rescan | re-read the archive folder after outside changes | no |
+| ⇪ import all | pull captions/dates/identity from a 4K Stogram db | no |
+| ↻ update / ⟲ Refresh all | download new content (one profile / all, slowly) | yes |
+
 First launch scans the collection in the background (slower the first time; cached forever after). Hit **⟳ rescan** after large external changes; per-profile **↻ update** re-scans that profile automatically when instaloader finishes. Stop the server cleanly from the UI with **⏻ quit** (or Ctrl-C in the terminal) — the shutdown page shows the exact command to relaunch *that* instance.
 
 ### Multiple archives / fresh testing

@@ -25,7 +25,7 @@ Design notes:
     thumbnails from them. A pure instaloader archive never uses any of this.
 """
 
-__version__ = "0.5.3"        # single source of truth — pyproject reads this
+__version__ = "0.5.4"        # single source of truth — pyproject reads this
 
 import configparser
 import hashlib
@@ -709,10 +709,24 @@ def load_scan_pending():
     return []
 
 
+def _root_reachable():
+    """Is the collection folder currently accessible? False when the drive or
+    network share (SMB drops happen) is unmounted — callers must not scan then,
+    or every profile would look deleted and the index would be wiped."""
+    try:
+        return ROOT.is_dir()
+    except OSError:
+        return False
+
+
 def rescan(profiles=None, full=False):
     """Background-safe scan. profiles=None means all. A pending set is persisted
     after every batch, so an interrupted scan auto-resumes on the next startup."""
     if SCAN["running"]:
+        return
+    if not _root_reachable():
+        print("rescan aborted: collection not reachable (%s) — is the drive or "
+              "network share mounted?" % ROOT)
         return
     SCAN["running"] = True
     try:
@@ -2680,7 +2694,12 @@ function upd(p){showLog();fetch('/update',{method:'POST',
  body:'profile='+encodeURIComponent(p)}).then(()=>poll(true));}
 function updAll(){if(!confirm('Run instaloader for every profile? This can take a while for large collections.'))return;
  showLog();fetch('/update-all',{method:'POST'}).then(()=>poll(true));}
-function rescan(){fetch('/rescan',{method:'POST'}).then(function(){
+function rescan(btn){
+ if(btn){btn.disabled=true;btn.textContent='⟳ scanning…';}
+ function restore(){if(btn){btn.disabled=false;btn.textContent='⟳ rescan';}}
+ fetch('/rescan',{method:'POST'}).then(function(r){return r.json();}).then(function(d){
+ if(d&&d.ok===false){restore();alert('Rescan failed: '+(d.note||'unknown'));return;}
+ setTimeout(livePoll,300);   /* surface the scan progress banner immediately */
  /* /rescan only *starts* a background scan; wait for it to finish before
     reloading, else new folders aren't in the index yet and look missed. */
  var seen=false,n=0;
@@ -3118,10 +3137,49 @@ function shutdownServer(){
    +'<code id="rcmd" style="background:#0e0e10;border:1px solid #2a2a32;border-radius:6px;'
    +'padding:8px 12px;color:#7fe08a;font:12px/1.4 ui-monospace,Menlo,monospace;'
    +'user-select:all;max-width:80vw;overflow:auto;white-space:pre">'+escapeHTML(cmd)+'</code>'
-   +'<button onclick="navigator.clipboard&&navigator.clipboard.writeText('+JSON.stringify(cmd)+')" '
+   +'<button onclick="copyRestart(this)" '
    +'style="background:#1c1c22;border:1px solid #2a2a32;border-radius:6px;color:#c9c9d0;'
-   +'padding:8px 10px;cursor:pointer;font-size:12px">copy</button></div></div>';
+   +'padding:8px 10px;cursor:pointer;font-size:12px">copy</button></div>'
+   +(cmd.indexOf('OFFGRAM_')>=0
+     ?'<div style="font-size:12px;margin-top:10px">OFFGRAM_* environment variables '
+      +'override the matching config.py settings (OFFGRAM_COLLECTION \\u2192 COLLECTION).</div>'
+     :'')
+   +'</div>';
  },500);
+}
+/* ---- ❓ help: what each header button does, in one line each ---- */
+function openHelp(){
+ function row(b,t){return '<div class="lrow" style="gap:10px"><span style="min-width:120px;font-weight:600">'+b+'</span><span class="sub">'+t+'</span></div>';}
+ openModal('<h3>What do these buttons do?</h3>'
+  +'<div class="lrows">'
+  +row('⚡ Quick check','Fast, anonymous \\u201cis this account still visible?\\u201d triage across all profiles. No login, no downloads.')
+  +row('♥ Check all','Deeper health check using your Instagram login: marks each profile alive \\u00b7 private \\u00b7 dead \\u00b7 renamed (the colored dot). Slow &amp; throttled.')
+  +row('⚡ scan updates','Asks Instagram whether each live account has posts newer than your archive \\u2014 downloads nothing; flags them \\u26a1 new posts.')
+  +row('⟳ rescan','Re-reads the archive folder from disk. Use after adding, moving, or deleting files outside offgram (e.g. instaloader run by hand).')
+  +row('⇪ import all','Copies captions, links, dates &amp; identity from a 4K Stogram database into matching folders. Safe to re-run.')
+  +row('⟲ Refresh all','Downloads NEW content for every tracked profile via instaloader, one profile every few minutes in the background. Needs a login (⚙ accounts).')
+  +row('↻ update (on a card)','Same download, but for that one profile, right now.')
+  +row('🗂 lists','Named groups/tags for organizing profiles; each list becomes a filter chip.')
+  +row('▦ select','Multi-select mode \\u2014 pick several profiles to assign to a list or ⤳ merge into one timeline.')
+  +row('💾 backup','Snapshot every offgram setting into a restorable .tar.gz. Your archive files are never included or touched.')
+  +row('⚙ accounts','Manage Instagram logins: import a session from a logged-in browser (easiest), test, switch, sign out.')
+  +row('▤ log','Live output of running downloads.')
+  +row('⏻ quit','Cleanly stop the offgram server.')
+  +'</div>'
+  +'<div class="sub" style="margin-top:10px">Rule of thumb: <b>rescan</b> reads your disk, '
+  +'<b>checks/scans</b> ask Instagram (no download), <b>update/refresh</b> download new content.</div>'
+  +'<div class="mbtns"><button class="btn" onclick="closeModal()">close</button></div>');}
+function copyRestart(btn){
+ var cmd=(document.getElementById('rcmd')||{}).textContent||'';
+ function done(ok){btn.textContent=ok?'copied \\u2713':'copy failed';
+  setTimeout(function(){btn.textContent='copy';},2000);}
+ function fallback(){var t=document.createElement('textarea');t.value=cmd;
+  t.style.position='fixed';t.style.opacity='0';document.body.appendChild(t);
+  t.select();var ok=false;try{ok=document.execCommand('copy');}catch(e){}
+  t.remove();done(ok);}
+ if(navigator.clipboard&&navigator.clipboard.writeText){
+  navigator.clipboard.writeText(cmd).then(function(){done(true);},fallback);}
+ else{fallback();}
 }
 if(document.getElementById('banners'))livePoll();   // index: live banner updates, no reload
 """
@@ -3484,20 +3542,30 @@ def render_index():
             "<span class='sub'>%d profiles · indexed %s</span>"
             "<span class='sp'></span>"
             "<span class='sub'>as</span>%s"
-            "<button class='btn' onclick='quickCheck()'>⚡ Quick check</button>"
-            "<button class='btn' onclick='heartbeat()'>♥ Check all</button>"
+            "<button class='btn' onclick='quickCheck()' title='Anonymous liveness "
+            "triage: is each account still visible on Instagram? Fast, no login'>"
+            "⚡ Quick check</button>"
+            "<button class='btn' onclick='heartbeat()' title='Authenticated health "
+            "check via your login: alive / private / dead / renamed dots'>"
+            "♥ Check all</button>"
             "<button class='btn' onclick='updScan()' title='Check live accounts "
             "for posts newer than the archive — no download'>⚡ scan updates</button>"
-            "<button class='btn' onclick='rescan()'>⟳ rescan</button>"
+            "<button class='btn' onclick='rescan(this)' title='Re-read the archive "
+            "folder from disk — use after files changed outside offgram'>"
+            "⟳ rescan</button>"
             "<button class='btn' onclick='importAll()' "
             "title='Idempotently rehydrate every folder that matches a 4K Stogram db'>"
             "⇪ import all</button>"
-            "<button class='btn go' onclick='refreshAll()'>⟲ Refresh all</button>"
+            "<button class='btn go' onclick='refreshAll()' title='Slow background "
+            "download of new content for every tracked profile (needs a login)'>"
+            "⟲ Refresh all</button>"
             "<button class='btn' onclick='openManage()'>🗂 lists</button>"
             "<button class='btn' onclick='toggleSelect()'>▦ select</button>"
             "<button class='btn' onclick='openBackup()'>💾 backup</button>"
             "<button class='btn' onclick='openAccounts()'>⚙ accounts</button>"
             "<button class='btn' onclick='toggleLog()'>▤ log</button>"
+            "<button class='btn' onclick='openHelp()' title='What do these "
+            "buttons do?'>❓</button>"
             "<button class='btn danger' onclick='shutdownServer()' "
             "title='Cleanly stop the offgram server'>⏻ quit</button></header>"
             "%s<div class='wrap'><div class='addbar' id='addbar'></div>"
@@ -3816,6 +3884,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             threading.Thread(target=run_update, args=(ps,), daemon=True).start()
             return self._send(200, b'{"ok":true}', "application/json")
         if u.path == "/rescan":
+            if not _root_reachable():
+                return self._send(503, json.dumps(
+                    {"ok": False,
+                     "note": "collection not reachable at %s — is the drive or "
+                             "network share mounted?" % str(ROOT)}).encode(),
+                    "application/json")
             start_scan_thread(None)
             return self._send(200, b'{"ok":true}', "application/json")
         if u.path == "/heartbeat":
@@ -4211,6 +4285,13 @@ def restart_command():
 
 def main():
     global SERVER
+    if not _root_reachable():
+        src = ("$OFFGRAM_COLLECTION" if os.environ.get("OFFGRAM_COLLECTION")
+               else CONFIG_PATH or "config")
+        raise SystemExit(
+            "offgram: collection folder not reachable: %s\n"
+            "Is the drive or network share mounted? "
+            "(configured via %s)" % (ROOT, src))
     load_db_index()
     mimetypes.add_type("video/mp4", ".mp4")
     load_health()
