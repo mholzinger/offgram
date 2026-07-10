@@ -25,9 +25,10 @@ Design notes:
     thumbnails from them. A pure instaloader archive never uses any of this.
 """
 
-__version__ = "0.5.4"        # single source of truth — pyproject reads this
+__version__ = "0.5.5"        # single source of truth — pyproject reads this
 
 import configparser
+import errno
 import hashlib
 import html
 import http.server
@@ -3836,6 +3837,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                 for k, v in JOBS.items()}
             payload = {"any": (jobs_running or SCAN["running"] or REFRESH["running"]
                                or HEARTBEAT["running"] or IMPORT["running"]),
+                       "version": __version__,
                        "scan": dict(SCAN), "prewarm": dict(PREWARM),
                        "heartbeat": dict(HEARTBEAT), "refresh": refresh_snapshot(),
                        "import": dict(IMPORT), "phash": dict(PHASHJOB),
@@ -4249,7 +4251,7 @@ def request_shutdown():
     """Clean shutdown: signal stoppable background jobs, then break serve_forever()
     from a side thread (after the HTTP response has flushed) so main() returns and
     the process exits normally rather than being hard-killed."""
-    for job in (REFRESH, HEARTBEAT, IMPORT, PHASHJOB):
+    for job in (REFRESH, HEARTBEAT, IMPORT, PHASHJOB, UPDSCAN):
         try:
             job["stop"] = True
         except Exception:                     # noqa: BLE001
@@ -4265,6 +4267,74 @@ def request_shutdown():
 
     threading.Thread(target=_go, daemon=True).start()
     print("shutdown requested from UI")
+
+
+def _acquire_server():
+    """Bind the web port. If an offgram instance is already listening — its tab
+    was closed but the server kept running, then a new launch (say, right after
+    an upgrade) hits 'address already in use' — offer to stop it cleanly and
+    take over, instead of dying with a traceback."""
+    try:
+        return ThreadingServer((HOST, PORT), Handler)
+    except OSError as exc:
+        if exc.errno != errno.EADDRINUSE:
+            raise
+    url = "http://%s:%d" % (HOST, PORT)
+    st = None
+    try:                              # is the squatter an offgram instance?
+        with urllib.request.urlopen(url + "/status", timeout=3) as r:
+            d = json.loads(r.read().decode("utf-8", "replace"))
+        if isinstance(d, dict) and "scan" in d and "refresh" in d:
+            st = d
+    except Exception:                                 # noqa: BLE001
+        pass
+    if st is None:
+        raise SystemExit(
+            "offgram: port %d is already in use by another program.\n"
+            "Start on a different port:  OFFGRAM_PORT=%d offgram" % (PORT, PORT + 1))
+    ver = st.get("version")
+    print("offgram%s is already running at %s%s"
+          % ((" v%s" % ver) if ver else "", url,
+             " — and is busy with a download or scan" if st.get("any") else ""))
+    try:
+        interactive = sys.stdin is not None and sys.stdin.isatty()
+    except Exception:                                 # noqa: BLE001
+        interactive = False
+    take = False
+    if interactive:
+        try:
+            ans = input("Stop it and start this instance instead? [Y/n] ").strip().lower()
+            take = ans in ("", "y", "yes")
+        except (EOFError, KeyboardInterrupt):
+            take = False
+    if not take:
+        print("Leaving it running — that page is your gallery. "
+              "(⏻ quit in the page stops it; OFFGRAM_PORT=%d runs a second instance.)"
+              % (PORT + 1))
+        if os.environ.get("OFFGRAM_NO_BROWSER", "") not in ("1", "true", "yes"):
+            try:
+                import webbrowser
+                webbrowser.open(url)
+            except Exception:                         # noqa: BLE001
+                pass
+        raise SystemExit(0)
+    try:
+        urllib.request.urlopen(
+            urllib.request.Request(url + "/shutdown", data=b"", method="POST"),
+            timeout=5).read()
+    except Exception:                                 # noqa: BLE001
+        pass
+    for _ in range(40):               # the old process exits on its own; ~10 s grace
+        time.sleep(0.25)
+        try:
+            server = ThreadingServer((HOST, PORT), Handler)
+            print("stopped the previous instance — taking over the port.")
+            return server
+        except OSError:
+            continue
+    raise SystemExit(
+        "offgram: the running instance did not stop in time. Quit it from its "
+        "page (⏻) and run offgram again, or use OFFGRAM_PORT=%d." % (PORT + 1))
 
 
 def restart_command():
@@ -4292,6 +4362,9 @@ def main():
             "offgram: collection folder not reachable: %s\n"
             "Is the drive or network share mounted? "
             "(configured via %s)" % (ROOT, src))
+    # claim the port FIRST: a takeover of a still-running older instance must
+    # finish before we load state files that instance could still be writing
+    server = _acquire_server()
     load_db_index()
     mimetypes.add_type("video/mp4", ".mp4")
     load_health()
@@ -4317,7 +4390,6 @@ def main():
         start_scan_thread(pending)
     else:
         start_prewarm()                              # warm thumbnails for instaloader profiles
-    server = ThreadingServer((HOST, PORT), Handler)
     SERVER = server
     url = "http://%s:%d" % (HOST, PORT)
     print("\n  offgram v%s%s →  %s"

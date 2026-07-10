@@ -143,6 +143,8 @@ offgram                    # if pipx-installed
 
 Your browser opens to `http://localhost:8077` automatically (set `OFFGRAM_NO_BROWSER=1` to skip, e.g. on a headless box).
 
+Closing the tab doesn't stop the server — it keeps running until **⏻ quit** or Ctrl-C. If you run `offgram` while one is already running (say, right after an upgrade), it notices, and offers to stop the old instance and take over the port.
+
 **Button cheat-sheet** (also in-app via **❓**): *rescan* reads your disk; *checks/scans* ask Instagram without downloading; *update/refresh* download new content.
 
 | Button | What it does | Needs login? |
