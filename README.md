@@ -89,9 +89,11 @@ This pulls in the patched instaloader fork automatically and gives you an `offgr
 
 ```bash
 git clone https://github.com/mholzinger/offgram && cd offgram
-python3 -m venv .venv && source .venv/bin/activate
-pip install -e .
+./dev.sh          # bootstraps a venv (editable installs) and starts against a throwaway archive on port 8079
+./dev.sh real     # the checkout's code against your configured collection
 ```
+
+`dev.sh` installs offgram editable (edits apply on restart) and, when a local instaloader fork checkout exists (`~/src/instaloader` or `$OFFGRAM_FORK`), installs the engine editable from it too — the startup banner names the engine branch you're running.
 
 ## Configure
 
