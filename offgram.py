@@ -25,7 +25,7 @@ Design notes:
     thumbnails from them. A pure instaloader archive never uses any of this.
 """
 
-__version__ = "0.5.7"        # single source of truth — pyproject reads this
+__version__ = "0.5.8"        # single source of truth — pyproject reads this
 
 import configparser
 import errno
@@ -2249,7 +2249,9 @@ UPDATE_LOCK = threading.Lock()
 def run_update(profiles):
     for profile in profiles:
         with JOBS_LOCK:
-            JOBS[profile] = {"running": True, "log": [], "rc": None}
+            # queued=True until this profile actually starts downloading, so
+            # the log panel can show (queued) instead of a misleading (running)
+            JOBS[profile] = {"running": True, "queued": True, "log": [], "rc": None}
     for profile in profiles:
         if not UPDATE_LOCK.acquire(blocking=False):
             with JOBS_LOCK:
@@ -2259,6 +2261,10 @@ def run_update(profiles):
                         "offgram: queued behind another running update "
                         "(downloads run one at a time to protect latest-stamps)")
             UPDATE_LOCK.acquire()
+        with JOBS_LOCK:
+            j = JOBS.get(profile)
+            if j:
+                j["queued"] = False
         try:
             seed_stamps(profile)
             _run_one(profile)
@@ -2741,7 +2747,7 @@ document.addEventListener('keydown',e=>{
  if(e.key==='Escape')closeLB();if(e.key==='ArrowLeft')step(-1);if(e.key==='ArrowRight')step(1);});
 function showLog(){document.getElementById('log').style.display='block';}
 function renderLog(j){var lines=[],jobs=(j&&j.jobs)||{};
- for(var k in jobs){lines.push('### '+k+(jobs[k].running?' (running)':' (done)'));
+ for(var k in jobs){lines.push('### '+k+(jobs[k].running?(jobs[k].queued?' (queued — waiting its turn)':' (running)'):' (done)'));
   lines.push(jobs[k].log.slice(-20).join('\\n'));}
  document.getElementById('logbody').textContent=lines.length?lines.join('\\n')
   :'No activity yet.\\nRun an update (\\u21bb) and progress streams here live.';}
@@ -2985,6 +2991,10 @@ function addProfile(name){name=igName(name);if(!name)return;
  showLog();fetch('/add',{method:'POST',
   headers:{'Content-Type':'application/x-www-form-urlencoded'},
   body:'profile='+encodeURIComponent(name)}).then(function(){poll(true);});}
+function revealFolder(p){fetch('/reveal',{method:'POST',
+ headers:{'Content-Type':'application/x-www-form-urlencoded'},
+ body:'profile='+encodeURIComponent(p)}).then(function(r){return r.json();}).then(function(d){
+  if(!d.ok)alert('Could not open the folder: '+(d.note||'unknown'));}).catch(function(){});}
 function setTrack(p,mode){fetch('/track',{method:'POST',
  headers:{'Content-Type':'application/x-www-form-urlencoded'},
  body:'profile='+encodeURIComponent(p)+'&mode='+mode}).then(function(){location.reload();});}
@@ -3220,6 +3230,7 @@ function openHelp(){
   +row('⟲ Refresh all','Downloads NEW content for every tracked profile via instaloader, one profile every few minutes in the background. Needs a login (⚙ accounts).')
   +row('↻ update (on a card)','Same download, but for that one profile, right now.')
   +row('🗂 lists','Named groups/tags for organizing profiles; each list becomes a filter chip.')
+  +row('📂 (on a card)','Opens that profile\\u2019s folder in Finder / your file manager.')
   +row('▦ select','Multi-select mode \\u2014 pick several profiles to assign to a list or ⤳ merge into one timeline.')
   +row('💾 backup','Snapshot every offgram setting into a restorable .tar.gz. Your archive files are never included or touched.')
   +row('⚙ accounts','Manage Instagram logins: import a session from a logged-in browser (easiest), test, switch, sign out.')
@@ -3449,9 +3460,13 @@ def render_index():
         impb = ("<button class='btn' onclick=\"importMenu('%s')\" "
                 "title='Import metadata for this folder (4K Stogram, …)'>"
                 "⇪ import…</button>" % pe)
+        revb = ("<button class='btn' onclick=\"revealFolder('%s')\" "
+                "title='Show this profile&#39;s folder in your file manager'>"
+                "📂</button>" % pe)
         if hid:
             actions = (("<button class='btn' onclick=\"restoreProfile('%s')\">↶ restore"
                         "</button>" % pe)
+                       + revb
                        + ("<button class='btn danger' onclick=\"deleteProfile('%s')\" "
                           "title='Permanently delete files from disk'>🗑 delete from disk"
                           "</button>" % pe))
@@ -3459,14 +3474,14 @@ def render_index():
         elif arch:
             actions = (("<button class='btn' onclick=\"setTrack('%s','active')\" "
                         "title='Resume updates'>▶ track</button>" % pe)
-                       + valb + impb + listb + rmb)
+                       + valb + impb + listb + revb + rmb)
             tag = "<span class='tag'>archive-only</span>"
         else:
             actions = (("<button class='btn' onclick=\"upd('%s')\">↻ update</button>" % pe)
                        + valb + impb
                        + ("<button class='btn' onclick=\"setTrack('%s','archive')\" "
                           "title='View-only: stop updating'>⊘ archive</button>" % pe)
-                       + listb + rmb)
+                       + listb + revb + rmb)
             tag = ""
         if merged:
             tag += ("<a class='tag' href='/m/%s' title='Part of a merge'>⤳ merged</a>"
@@ -3659,11 +3674,13 @@ def render_profile(profile):
     pe = urllib.parse.quote(profile)
     body = ("<header><a href='/' class='btn'>‹ all</a><h1>%s</h1>"
             "<span class='sub'>%d items</span><span class='sp'></span>"
+            "<button class='btn' onclick=\"revealFolder('%s')\" "
+            "title='Show this profile&#39;s folder in your file manager'>📂 folder</button>"
             "<button class='btn go' onclick=\"upd('%s')\">↻ update this profile</button></header>"
             "<div class='wrap'><div class='tabs'>%s</div>"
             "<div class='mediagrid' id='mg'></div>"
             "<div id='sentinel' style='height:1px'></div></div>"
-            % (html.escape(profile), len(items), pe, "".join(tabs)))
+            % (html.escape(profile), len(items), pe, pe, "".join(tabs)))
     # Windowed grid: cells are rendered from ITEMS in batches as you scroll, so a
     # huge profile doesn't build thousands of DOM nodes (or a giant HTML page) up
     # front. openLB indexes the full ITEMS array, so the lightbox is unaffected.
@@ -3892,7 +3909,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/status":
             with JOBS_LOCK:
                 jobs_running = any(j["running"] for j in JOBS.values())
-                jobs_payload = {k: {"running": v["running"], "log": v["log"][-20:]}
+                jobs_payload = {k: {"running": v["running"],
+                                    "queued": v.get("queued", False),
+                                    "log": v["log"][-20:]}
                                 for k, v in JOBS.items()}
             payload = {"any": (jobs_running or SCAN["running"] or REFRESH["running"]
                                or HEARTBEAT["running"] or IMPORT["running"]),
@@ -4133,6 +4152,35 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 with REFRESH_LOCK:
                     REFRESH["queue"] = []
                 save_refresh()
+            return self._send(200, b'{"ok":true}', "application/json")
+        if u.path == "/reveal":
+            # open the profile's folder in the OS file manager — offgram serves
+            # localhost only, so the browser and the files share a machine
+            p = form.get("profile", [""])[0]
+            if p not in INDEX["profiles"]:
+                return self._send(404, b'{"ok":false,"note":"unknown profile"}',
+                                  "application/json")
+            d = ROOT / p
+            try:
+                exists = d.is_dir()
+            except OSError:
+                exists = False
+            if not exists:
+                return self._send(404, json.dumps(
+                    {"ok": False, "note": "folder not found on disk — is the "
+                     "drive or network share mounted?"}).encode(),
+                    "application/json")
+            try:
+                if sys.platform == "darwin":
+                    subprocess.Popen(["open", str(d)])
+                elif os.name == "nt":
+                    os.startfile(str(d))          # noqa: S606  # type: ignore[attr-defined]
+                else:
+                    subprocess.Popen(["xdg-open", str(d)])
+            except Exception as exc:              # noqa: BLE001
+                return self._send(500, json.dumps(
+                    {"ok": False, "note": str(exc)[:120]}).encode(),
+                    "application/json")
             return self._send(200, b'{"ok":true}', "application/json")
         if u.path == "/track":
             p = form.get("profile", [""])[0]
