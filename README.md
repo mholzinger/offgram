@@ -114,6 +114,8 @@ instaloader --login YOUR_USERNAME
 ~/.local/pipx/venvs/offgram/bin/instaloader --login YOUR_USERNAME
 ```
 
+If you already have a saved session, offgram uses it automatically — `INSTALOADER_LOGIN` only matters for choosing between several. Without any login, updates fail fast with a clear message instead of Instagram's misleading anonymous-request errors.
+
 Add more accounts the same way — they appear in the in-app account switcher. Or skip the CLI entirely: in the running app, **⚙ accounts → import** pulls a session straight from a logged-in browser (`--load-cookies`), no password or 2FA required. Browser import needs the optional `browser_cookie3` package (`pip install browser_cookie3`); **Firefox or Chrome are the most reliable** — Safari cookie access is flaky on macOS.
 
 ### Environment variables (override config)
@@ -178,6 +180,8 @@ Use `OFFGRAM_CACHE` to pin an explicit cache directory, or `OFFGRAM_CACHE_HOME` 
 All of offgram's state lives in its cache, never in your archive. To reset completely: quit the app (**⏻** or Ctrl-C), `rm -rf ~/.cache/offgram`, relaunch — it rescans from the files on disk, and your archive is untouched. A leftover background refresh queue from a previous run shows up as a banner with **▶ resume / ■ clear** buttons; **■ clear** drops it.
 
 ### Diagnostics
+
+Update output streams live into the **▤ log** panel and is also appended to `update.log` in the cache directory (`~/.cache/offgram/<archive>/update.log`), so errors survive closed windows and reloads.
 
 Append `?debug=1` to any page (or press **Shift+D**) for an opt-in overlay that samples DOM node count, JS heap (Chrome only), fetch rate, and live timer count over time — handy for spotting a slow client-side leak. History is exportable from the console via `copy(JSON.stringify(__leak.hist))`.
 

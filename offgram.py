@@ -25,7 +25,7 @@ Design notes:
     thumbnails from them. A pure instaloader archive never uses any of this.
 """
 
-__version__ = "0.5.6"        # single source of truth — pyproject reads this
+__version__ = "0.5.7"        # single source of truth — pyproject reads this
 
 import configparser
 import errno
@@ -869,6 +869,15 @@ def current_login():
             pass
         if not ACTIVE_LOGIN:
             ACTIVE_LOGIN = INSTALOADER_LOGIN
+        if not ACTIVE_LOGIN:
+            # nothing configured — default to a saved session rather than running
+            # anonymously (Instagram 403s anonymous requests, which instaloader
+            # then reports as the misleading "profile does not exist")
+            sessions = list_sessions()
+            if sessions:
+                ACTIVE_LOGIN = sessions[0]
+                print("offgram: no login configured — using saved session @%s "
+                      "(switch accounts via ⚙ accounts)" % ACTIVE_LOGIN)
     return ACTIVE_LOGIN
 
 
@@ -2208,11 +2217,48 @@ def seed_stamps(profile):
                         for k, v in newest.items()))
 
 
+UPDATE_LOG_FILE = CACHE_ROOT / "update.log"
+
+
+def _append_update_log(profile):
+    """Persist a finished job's log to update.log (the in-app ▤ log panel is
+    in-memory only — testers asked where the errors went after a reload)."""
+    try:
+        with JOBS_LOCK:
+            lines = list((JOBS.get(profile) or {}).get("log") or [])
+        if not lines:
+            return
+        CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+        with open(UPDATE_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write("\n=== %s — %s ===\n%s\n"
+                    % (time.strftime("%Y-%m-%d %H:%M:%S"), profile,
+                       "\n".join(lines)))
+        if UPDATE_LOG_FILE.stat().st_size > 2_000_000:   # keep roughly the last 1 MB
+            tail = UPDATE_LOG_FILE.read_bytes()[-1_000_000:]
+            _atomic_write_text(UPDATE_LOG_FILE, tail.decode("utf-8", "replace"))
+    except Exception:                                 # noqa: BLE001
+        pass
+
+
+# Serializes ALL instaloader runs (manual ↻, update-all, Refresh all, + add):
+# two concurrent runs both rewrite latest-stamps.ini whole-file, last writer
+# wins, and a clobbered stamp silently re-downloads history on a later pass.
+UPDATE_LOCK = threading.Lock()
+
+
 def run_update(profiles):
     for profile in profiles:
         with JOBS_LOCK:
             JOBS[profile] = {"running": True, "log": [], "rc": None}
     for profile in profiles:
+        if not UPDATE_LOCK.acquire(blocking=False):
+            with JOBS_LOCK:
+                j = JOBS.get(profile)
+                if j:
+                    j["log"].append(
+                        "offgram: queued behind another running update "
+                        "(downloads run one at a time to protect latest-stamps)")
+            UPDATE_LOCK.acquire()
         try:
             seed_stamps(profile)
             _run_one(profile)
@@ -2235,6 +2281,7 @@ def run_update(profiles):
             except Exception:                          # noqa: BLE001
                 pass
         finally:
+            UPDATE_LOCK.release()
             # never leave a job falsely "running" if a pass threw before _run_one
             with JOBS_LOCK:
                 j = JOBS.get(profile)
@@ -2242,6 +2289,7 @@ def run_update(profiles):
                     j["running"] = False
                     if j.get("rc") is None:
                         j["rc"] = -1
+            _append_update_log(profile)
 
 
 # ---------------------------------------------------------------------------
@@ -2372,6 +2420,17 @@ def _il_run(folder, target, dirpat, flags, extra=None):
 
 def _run_one(folder):
     log = JOBS[folder]["log"]
+    if not current_login():
+        # fail FAST and clearly: anonymous instaloader runs get 403'd by
+        # Instagram and surface as a baffling "profile does not exist"
+        log.append("offgram: NO INSTAGRAM LOGIN — updates need one.")
+        log.append("Open ⚙ accounts and import a session from a browser where "
+                   "you're logged in (no password needed), or set "
+                   "INSTALOADER_LOGIN in config.py. Nothing was downloaded.")
+        with JOBS_LOCK:
+            JOBS[folder]["running"] = False
+            JOBS[folder]["rc"] = 1
+        return
     target = identity_handle(folder)                  # current live handle
     if target != folder:
         log.append("--- renamed: fetching @%s into %s/ ---" % (target, folder))
@@ -3164,7 +3223,7 @@ function openHelp(){
   +row('▦ select','Multi-select mode \\u2014 pick several profiles to assign to a list or ⤳ merge into one timeline.')
   +row('💾 backup','Snapshot every offgram setting into a restorable .tar.gz. Your archive files are never included or touched.')
   +row('⚙ accounts','Manage Instagram logins: import a session from a logged-in browser (easiest), test, switch, sign out.')
-  +row('▤ log','Live output of running downloads.')
+  +row('▤ log','Live output of running downloads. Also saved to update.log in the cache folder, so errors survive a closed window.')
   +row('⏻ quit','Cleanly stop the offgram server.')
   +'</div>'
   +'<div class="sub" style="margin-top:10px">Rule of thumb: <b>rescan</b> reads your disk, '
