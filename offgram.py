@@ -25,7 +25,7 @@ Design notes:
     thumbnails from them. A pure instaloader archive never uses any of this.
 """
 
-__version__ = "0.5.5"        # single source of truth — pyproject reads this
+__version__ = "0.5.6"        # single source of truth — pyproject reads this
 
 import configparser
 import errno
@@ -274,7 +274,7 @@ SECTIONS = ["posts", "story", "reels", "highlights", "tagged"]
 # against current Instagram (retired doc_id / GraphQL changes). The default below
 # runs `python -m instaloader` in offgram's own interpreter, so installing
 # requirements.txt into that env wires up the fork automatically:
-#   instaloader @ git+https://github.com/mholzinger/instaloader@fix-profile-metadata-web-profile-info
+#   instaloader @ git+https://github.com/mholzinger/instaloader@offgram-stable
 # Login is required (Instagram 403s anonymous requests). INSTALOADER_LOGIN (from
 # config.py) names a session in ~/.config/instaloader/ (make one via `instaloader
 # --login USER`).

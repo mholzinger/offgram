@@ -22,7 +22,7 @@ classifiers = [
 # offgram itself is standard-library only; the one runtime dependency is the
 # patched instaloader fork (stock 4.15.1 is broken against current Instagram).
 dependencies = [
-    "instaloader @ git+https://github.com/mholzinger/instaloader@fix-profile-metadata-web-profile-info",
+    "instaloader @ git+https://github.com/mholzinger/instaloader@offgram-stable",
 ]
 
 [project.urls]

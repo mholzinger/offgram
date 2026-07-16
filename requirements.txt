@@ -3,7 +3,7 @@
 # The single dependency is instaloader — and it MUST be the patched fork below.
 # Stock instaloader 4.15.1 is broken against current Instagram (retired doc_id /
 # GraphQL changes). This fork carries the unmerged fixes.
-instaloader @ git+https://github.com/mholzinger/instaloader@fix-profile-metadata-web-profile-info
+instaloader @ git+https://github.com/mholzinger/instaloader@offgram-stable
 
 # Optional: enables "⚙ accounts → import" (load a session from a logged-in
 # browser via instaloader --load-cookies). Without it, create sessions the normal

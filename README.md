@@ -71,7 +71,7 @@ It's a single dependency-free Python file (standard library only). The archive c
 Stock instaloader `4.15.1` is **broken against current Instagram** (retired `doc_id` / GraphQL changes), and Instagram now returns `403` to anonymous requests. offgram therefore depends on a fork carrying the unmerged fixes, and needs a logged-in session for updates and the authenticated heartbeat:
 
 ```
-instaloader @ git+https://github.com/mholzinger/instaloader@fix-profile-metadata-web-profile-info
+instaloader @ git+https://github.com/mholzinger/instaloader@offgram-stable
 ```
 
 ## Install
