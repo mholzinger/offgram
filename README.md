@@ -183,7 +183,7 @@ All of offgram's state lives in its cache, never in your archive. To reset compl
 
 ### Diagnostics
 
-Update output streams live into the **▤ log** panel and is also appended to `update.log` in the cache directory (`~/.cache/offgram/<archive>/update.log`), so errors survive closed windows and reloads.
+Update output streams live into the **▤ log** panel (which stays open across page reloads until you close it) and is streamed line-by-line to `update.log` in the cache directory (`~/.cache/offgram/<archive>/update.log`), so `tail -f` follows a running update in real time and errors survive closed windows.
 
 Append `?debug=1` to any page (or press **Shift+D**) for an opt-in overlay that samples DOM node count, JS heap (Chrome only), fetch rate, and live timer count over time — handy for spotting a slow client-side leak. History is exportable from the console via `copy(JSON.stringify(__leak.hist))`.
 

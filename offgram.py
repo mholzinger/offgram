@@ -25,7 +25,7 @@ Design notes:
     thumbnails from them. A pure instaloader archive never uses any of this.
 """
 
-__version__ = "0.5.8"        # single source of truth — pyproject reads this
+__version__ = "0.5.9"        # single source of truth — pyproject reads this
 
 import configparser
 import errno
@@ -2220,24 +2220,42 @@ def seed_stamps(profile):
 UPDATE_LOG_FILE = CACHE_ROOT / "update.log"
 
 
-def _append_update_log(profile):
-    """Persist a finished job's log to update.log (the in-app ▤ log panel is
-    in-memory only — testers asked where the errors went after a reload)."""
+UPDATE_LOG_LOCK = threading.Lock()
+_update_log_writes = {"n": 0}
+
+
+def _stream_update_log(profile, line):
+    """Append one job-log line to update.log AS IT HAPPENS, prefixed with its
+    profile — so `tail -f update.log` follows a running update in real time
+    (testers tried exactly that). Size-capped every few hundred writes."""
     try:
-        with JOBS_LOCK:
-            lines = list((JOBS.get(profile) or {}).get("log") or [])
-        if not lines:
-            return
-        CACHE_ROOT.mkdir(parents=True, exist_ok=True)
-        with open(UPDATE_LOG_FILE, "a", encoding="utf-8") as f:
-            f.write("\n=== %s — %s ===\n%s\n"
-                    % (time.strftime("%Y-%m-%d %H:%M:%S"), profile,
-                       "\n".join(lines)))
-        if UPDATE_LOG_FILE.stat().st_size > 2_000_000:   # keep roughly the last 1 MB
-            tail = UPDATE_LOG_FILE.read_bytes()[-1_000_000:]
-            _atomic_write_text(UPDATE_LOG_FILE, tail.decode("utf-8", "replace"))
+        with UPDATE_LOG_LOCK:
+            CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+            with open(UPDATE_LOG_FILE, "a", encoding="utf-8") as f:
+                f.write("%s [%s] %s\n"
+                        % (time.strftime("%H:%M:%S"), profile, line))
+            _update_log_writes["n"] += 1
+            if _update_log_writes["n"] % 500 == 0 and \
+                    UPDATE_LOG_FILE.stat().st_size > 2_000_000:
+                tail = UPDATE_LOG_FILE.read_bytes()[-1_000_000:]   # keep ~1 MB
+                _atomic_write_text(UPDATE_LOG_FILE,
+                                   tail.decode("utf-8", "replace"))
     except Exception:                                 # noqa: BLE001
         pass
+
+
+class _JobLog(list):
+    """A job's in-memory log that mirrors every appended line into update.log."""
+
+    def __init__(self, profile):
+        super().__init__()
+        self._profile = profile
+        _stream_update_log(profile, "=== %s — update started ==="
+                           % time.strftime("%Y-%m-%d %H:%M:%S"))
+
+    def append(self, line):
+        super().append(line)
+        _stream_update_log(self._profile, line)
 
 
 # Serializes ALL instaloader runs (manual ↻, update-all, Refresh all, + add):
@@ -2251,7 +2269,8 @@ def run_update(profiles):
         with JOBS_LOCK:
             # queued=True until this profile actually starts downloading, so
             # the log panel can show (queued) instead of a misleading (running)
-            JOBS[profile] = {"running": True, "queued": True, "log": [], "rc": None}
+            JOBS[profile] = {"running": True, "queued": True,
+                             "log": _JobLog(profile), "rc": None}
     for profile in profiles:
         if not UPDATE_LOCK.acquire(blocking=False):
             with JOBS_LOCK:
@@ -2295,7 +2314,6 @@ def run_update(profiles):
                     j["running"] = False
                     if j.get("rc") is None:
                         j["rc"] = -1
-            _append_update_log(profile)
 
 
 # ---------------------------------------------------------------------------
@@ -2745,7 +2763,12 @@ function renderLB(){let it=ITEMS[cur];let s=document.querySelector('#lb .stage')
 document.addEventListener('keydown',e=>{
  if(document.getElementById('lb').style.display!=='flex')return;
  if(e.key==='Escape')closeLB();if(e.key==='ArrowLeft')step(-1);if(e.key==='ArrowRight')step(1);});
-function showLog(){document.getElementById('log').style.display='block';}
+/* Log panel visibility persists across the automatic page reloads that follow
+   finished updates — otherwise the panel "keeps closing" mid-session. */
+function showLog(){document.getElementById('log').style.display='block';
+ try{localStorage.setItem('og_log','1');}catch(e){}}
+function closeLog(){document.getElementById('log').style.display='none';
+ try{localStorage.setItem('og_log','0');}catch(e){}}
 function renderLog(j){var lines=[],jobs=(j&&j.jobs)||{};
  for(var k in jobs){lines.push('### '+k+(jobs[k].running?(jobs[k].queued?' (queued — waiting its turn)':' (running)'):' (done)'));
   lines.push(jobs[k].log.slice(-20).join('\\n'));}
@@ -2789,8 +2812,8 @@ function heartbeatCtl(a){fetch('/heartbeat',{method:'POST',
  headers:{'Content-Type':'application/x-www-form-urlencoded'},
  body:'action='+a}).then(function(){setTimeout(livePoll,300);});}
 function toggleLog(){var l=document.getElementById('log');
- if(l.style.display==='block'){l.style.display='none';return;}
- l.style.display='block';fetch('/status').then(function(r){return r.json();}).then(renderLog);}
+ if(l.style.display==='block'){closeLog();return;}
+ showLog();fetch('/status').then(function(r){return r.json();}).then(renderLog);}
 function switchAcct(){var v=document.getElementById('acct').value;
  fetch('/account',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
   body:'login='+encodeURIComponent(v)}).then(function(){location.reload();});}
@@ -3234,7 +3257,7 @@ function openHelp(){
   +row('▦ select','Multi-select mode \\u2014 pick several profiles to assign to a list or ⤳ merge into one timeline.')
   +row('💾 backup','Snapshot every offgram setting into a restorable .tar.gz. Your archive files are never included or touched.')
   +row('⚙ accounts','Manage Instagram logins: import a session from a logged-in browser (easiest), test, switch, sign out.')
-  +row('▤ log','Live output of running downloads. Also saved to update.log in the cache folder, so errors survive a closed window.')
+  +row('▤ log','Live output of running downloads; stays open across reloads until you close it. Also streamed line-by-line to update.log in the cache folder (tail -f friendly).')
   +row('⏻ quit','Cleanly stop the offgram server.')
   +'</div>'
   +'<div class="sub" style="margin-top:10px">Rule of thumb: <b>rescan</b> reads your disk, '
@@ -3253,6 +3276,9 @@ function copyRestart(btn){
  else{fallback();}
 }
 if(document.getElementById('banners'))livePoll();   // index: live banner updates, no reload
+/* reopen the log panel after a reload if it was open — poll() keeps it live
+   while jobs run and stops on its own when everything is done */
+try{if(localStorage.getItem('og_log')==='1'&&document.getElementById('log')){showLog();poll();}}catch(e){}
 """
 
 
@@ -3266,8 +3292,8 @@ def page(title, body, extra_js=""):
             "<span class='nav r' onclick='step(1)'>›</span>"
             "<div class='stage'></div><div class='cap' id='cap'></div></div>"
             "<div id='log'><div class='loghdr'>activity log"
-            "<span class='x' onclick=\"document.getElementById('log')"
-            ".style.display='none'\">×</span></div><div id='logbody'></div></div>"
+            "<span class='x' onclick='closeLog()'>×</span></div>"
+            "<div id='logbody'></div></div>"
             "<div id='modal' onclick='if(event.target===this)closeModal()'>"
             "<div class='mbox' id='mbox'></div></div>"
             "<script>%s</script><script>%s</script></body></html>"
