@@ -25,7 +25,7 @@ Design notes:
     thumbnails from them. A pure instaloader archive never uses any of this.
 """
 
-__version__ = "0.5.9"        # single source of truth — pyproject reads this
+__version__ = "0.5.10"        # single source of truth — pyproject reads this
 
 import configparser
 import errno
@@ -1148,8 +1148,14 @@ def delete_profile(folder):
     import shutil
     try:
         target = (ROOT / folder).resolve()
-        if target.parent != ROOT.resolve() or not target.is_dir():
+        if target.parent != ROOT.resolve():
             return False
+        if not target.is_dir():
+            # phantom entry (a failed add, a typo'd name): no folder ever
+            # existed, so purging offgram's state IS the deletion
+            purge_profile_state(folder)
+            print("removed %s (no folder on disk — index entry purged)" % folder)
+            return True
     except Exception:                                 # noqa: BLE001
         return False
     try:
