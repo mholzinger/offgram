@@ -160,7 +160,7 @@ Closing the tab doesn't stop the server — it keeps running until **⏻ quit** 
 | ⇪ import all | pull captions/dates/identity from a 4K Stogram db | no |
 | ↻ update / ⟲ Refresh all | download new content (one profile / all, slowly) | yes |
 
-First launch scans the collection in the background (slower the first time; cached forever after). Hit **⟳ rescan** after large external changes; per-profile **↻ update** re-scans that profile automatically when instaloader finishes. Stop the server cleanly from the UI with **⏻ quit** (or Ctrl-C in the terminal) — the shutdown page shows the exact command to relaunch *that* instance.
+First launch scans the collection in the background (slower the first time; cached forever after). On every launch, offgram also checks each profile folder's modification time against the index and automatically re-scans any that changed while it wasn't looking (hand-added files, an update interrupted by a restart, an external instaloader run). Hit **⟳ rescan** after large external changes; per-profile **↻ update** re-scans that profile automatically when instaloader finishes. Stop the server cleanly from the UI with **⏻ quit** (or Ctrl-C in the terminal) — the shutdown page shows the exact command to relaunch *that* instance.
 
 ### Multiple archives / fresh testing
 

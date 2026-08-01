@@ -25,7 +25,7 @@ Design notes:
     thumbnails from them. A pure instaloader archive never uses any of this.
 """
 
-__version__ = "0.5.10"        # single source of truth — pyproject reads this
+__version__ = "0.5.11"        # single source of truth — pyproject reads this
 
 import configparser
 import errno
@@ -607,13 +607,24 @@ def section_dir(profile, section):
     return ROOT / profile if section == "posts" else ROOT / profile / section
 
 
+def _profile_disk_mtime(profile):
+    """Newest mtime across a profile's folder and its section subfolders — the
+    cheap signal that files changed outside offgram's own update flow. (A file
+    landing in reels/ only bumps reels/'s mtime, not the parent's.)"""
+    best = 0.0
+    for d in [ROOT / profile] + [ROOT / profile / s
+                                 for s in SECTIONS if s != "posts"]:
+        try:
+            best = max(best, d.stat().st_mtime)
+        except OSError:
+            pass
+    return best
+
+
 def scan_profile(profile):
     """One deep read of a profile from the archive. Returns its index record."""
     rec = {"counts": {}, "total": 0, "cover": None, "sections": {}, "mtime": 0}
-    try:
-        rec["mtime"] = (ROOT / profile).stat().st_mtime
-    except OSError:
-        pass
+    rec["mtime"] = _profile_disk_mtime(profile)
     # legacy profiles already have 4K Stogram thumbnails; the pre-warm skips them.
     rec["legacy"] = (ROOT / profile / ".thumb.stogram").is_dir()
     cover_key = ""
@@ -1863,6 +1874,25 @@ def start_quickcheck():
 def start_scan_thread(profiles=None):
     threading.Thread(target=rescan, kwargs={"profiles": profiles},
                      daemon=True).start()
+
+
+def _rescan_stale_profiles():
+    """Startup self-heal: any profile whose folder changed since the cached
+    index was built (files added by hand, an update interrupted by a restart,
+    an external instaloader run) gets re-scanned automatically — the UI must
+    never show a stale "empty" for a folder full of media."""
+    if not _root_reachable() or SCAN["running"]:
+        return
+    with INDEX_LOCK:
+        recs = list(INDEX["profiles"].items())
+    stale = [name for name, rec in recs
+             if _profile_disk_mtime(name) > (rec.get("mtime") or 0) + 1]
+    if stale:
+        print("startup: %d profile folder(s) changed since last index — "
+              "rescanning: %s"
+              % (len(stale),
+                 ", ".join(stale[:8]) + ("…" if len(stale) > 8 else "")))
+        start_scan_thread(stale)
 
 
 # ---------------------------------------------------------------------------
@@ -4529,6 +4559,9 @@ def main():
         start_scan_thread(pending)
     else:
         start_prewarm()                              # warm thumbnails for instaloader profiles
+        # background stale check: stats every profile folder (cheap locally,
+        # seconds on a NAS) and rescans the ones that changed under us
+        threading.Thread(target=_rescan_stale_profiles, daemon=True).start()
     SERVER = server
     url = "http://%s:%d" % (HOST, PORT)
     print("\n  offgram v%s%s →  %s"
