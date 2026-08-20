@@ -136,6 +136,7 @@ Add more accounts the same way — they appear in the in-app account switcher. O
 | `OFFGRAM_PASS_DELAY` | `6` | seconds between instaloader passes (throttle protection) |
 | `OFFGRAM_HEARTBEAT_INTERVAL` | `4` | seconds between heartbeat checks |
 | `OFFGRAM_UPDSCAN_INTERVAL` | `5` | seconds between ⚡ update-scan probes |
+| `OFFGRAM_FIRST_CLONE` | `100` | a new profile's first download grabs only the N most recent posts/reels (`0` = full history at once) |
 | `OFFGRAM_NO_BROWSER` | — | set to `1` to skip auto-opening the browser on start |
 
 ## Run
@@ -158,7 +159,8 @@ Closing the tab doesn't stop the server — it keeps running until **⏻ quit** 
 | ⚡ scan updates | flags accounts with posts newer than your archive (no download) | yes |
 | ⟳ rescan | re-read the archive folder after outside changes | no |
 | ⇪ import all | pull captions/dates/identity from a 4K Stogram db | no |
-| ↻ update / ⟲ Refresh all | download new content (one profile / all, slowly) | yes |
+| ↻ update / ⟲ Refresh all | download new content (one profile / all, slowly); a profile's FIRST download is capped to the most recent 100 posts/reels | yes |
+| ⏬ backfill | deep pass fetching a profile's full history (the follow-up to a capped first clone); resumable | yes |
 
 First launch scans the collection in the background (slower the first time; cached forever after). On every launch, offgram also checks each profile folder's modification time against the index and automatically re-scans any that changed while it wasn't looking (hand-added files, an update interrupted by a restart, an external instaloader run). Hit **⟳ rescan** after large external changes; per-profile **↻ update** re-scans that profile automatically when instaloader finishes. Stop the server cleanly from the UI with **⏻ quit** (or Ctrl-C in the terminal) — the shutdown page shows the exact command to relaunch *that* instance.
 

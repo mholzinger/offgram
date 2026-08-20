@@ -25,7 +25,7 @@ Design notes:
     thumbnails from them. A pure instaloader archive never uses any of this.
 """
 
-__version__ = "0.5.11"        # single source of truth — pyproject reads this
+__version__ = "0.5.12"        # single source of truth — pyproject reads this
 
 import configparser
 import errno
@@ -2300,7 +2300,7 @@ class _JobLog(list):
 UPDATE_LOCK = threading.Lock()
 
 
-def run_update(profiles):
+def run_update(profiles, deep=False):
     for profile in profiles:
         with JOBS_LOCK:
             # queued=True until this profile actually starts downloading, so
@@ -2321,8 +2321,9 @@ def run_update(profiles):
             if j:
                 j["queued"] = False
         try:
-            seed_stamps(profile)
-            _run_one(profile)
+            if not deep:              # backfill never touches the stamps
+                seed_stamps(profile)
+            _run_one(profile, deep=deep)
             # refresh just this profile in the index after download
             try:
                 rec = scan_profile(profile)
@@ -2448,13 +2449,20 @@ def resume_refresh():
     return True
 
 
-def _il_run(folder, target, dirpat, flags, extra=None):
+def _il_run(folder, target, dirpat, flags, extra=None, deep=False):
     """Run one instaloader pass fetching `target` (the current handle) into the
     literal `dirpat` folder path. Streams output into folder's job log. Using a
     literal path (not {target}) keeps a renamed account's content in its original
-    folder and avoids instaloader nesting highlights by collection title."""
-    cmd = list(INSTALOADER_CMD) + INSTALOADER_COMMON
-    cmd += ["--dirname-pattern=" + dirpat, "--latest-stamps", str(STAMPS_FILE)]
+    folder and avoids instaloader nesting highlights by collection title.
+    deep=True is the backfill mode: no --fast-update and no --latest-stamps, so
+    the pass walks the FULL history (existing files are skipped cheaply) and
+    never advances the incremental stamps."""
+    if deep:
+        cmd = list(INSTALOADER_CMD) + ["--no-video-thumbnails"]
+        cmd += ["--dirname-pattern=" + dirpat]
+    else:
+        cmd = list(INSTALOADER_CMD) + INSTALOADER_COMMON
+        cmd += ["--dirname-pattern=" + dirpat, "--latest-stamps", str(STAMPS_FILE)]
     cmd += list(flags) + list(extra or [])
     if current_login():
         cmd += ["--login", current_login()]
@@ -2478,7 +2486,33 @@ def _il_run(folder, target, dirpat, flags, extra=None):
         return -1
 
 
-def _run_one(folder):
+# Gentle first clone: a brand-new profile's first pass fetches only the most
+# recent N posts/reels instead of the full history in one burst (large accounts
+# in one shot are the most automation-flag-prone thing offgram can do). History
+# arrives later via ⏬ backfill. 0 disables the cap.
+FIRST_CLONE_COUNT = int(os.environ.get("OFFGRAM_FIRST_CLONE", "100"))
+
+
+def _is_first_clone(folder):
+    """True when the profile has no media on disk yet — nothing in the folder
+    root or any section subfolder."""
+    d = ROOT / folder
+    try:
+        if not d.is_dir():
+            return True
+        for sub in [d] + [d / s for s in SECTIONS if s != "posts"]:
+            if not sub.is_dir():
+                continue
+            with os.scandir(sub) as it:
+                for e in it:
+                    if e.is_file() and Path(e.name).suffix.lower() in MEDIA_EXT:
+                        return False
+        return True
+    except OSError:
+        return False      # unreachable disk: don't guess; the run fails loudly anyway
+
+
+def _run_one(folder, deep=False):
     log = JOBS[folder]["log"]
     if not current_login():
         # fail FAST and clearly: anonymous instaloader runs get 403'd by
@@ -2494,12 +2528,30 @@ def _run_one(folder):
     target = identity_handle(folder)                  # current live handle
     if target != folder:
         log.append("--- renamed: fetching @%s into %s/ ---" % (target, folder))
-    rc = _il_run(folder, target, folder, [], INSTALOADER_EXTRA)   # posts -> folder/
-    if GRAB_EPHEMERAL:
+    cap = []
+    if deep:
+        log.append("--- backfill: deep pass over the full history — no "
+                   "fast-update, stamps untouched; Instagram's pacing and "
+                   "instaloader's resume files chunk this naturally ---")
+    elif FIRST_CLONE_COUNT > 0 and _is_first_clone(folder):
+        cap = ["--count", str(FIRST_CLONE_COUNT)]
+        log.append("offgram: first clone — fetching the %d most recent "
+                   "posts/reels only (gentler on Instagram). Get the full "
+                   "history later with ⏬ backfill; OFFGRAM_FIRST_CLONE=0 "
+                   "disables this cap." % FIRST_CLONE_COUNT)
+    rc = _il_run(folder, target, folder, [],
+                 list(INSTALOADER_EXTRA) + cap, deep=deep)        # posts -> folder/
+    if deep:
+        time.sleep(PASS_DELAY)
+        log.append("--- backfill: reels ---")
+        _il_run(folder, target, folder + "/reels",
+                ["--no-posts", "--reels"], deep=True)
+    elif GRAB_EPHEMERAL:
         for sub, flags in EPHEMERAL_PASSES:
             time.sleep(PASS_DELAY)                     # space out passes to avoid throttling
             log.append("--- fetching %s ---" % sub)
-            _il_run(folder, target, folder + "/" + sub, flags)   # -> folder/<sub>/
+            _il_run(folder, target, folder + "/" + sub,
+                    list(flags) + (cap if sub == "reels" else []))   # -> folder/<sub>/
     with JOBS_LOCK:
         JOBS[folder]["running"] = False
         JOBS[folder]["rc"] = rc
@@ -3050,6 +3102,11 @@ function addProfile(name){name=igName(name);if(!name)return;
  showLog();fetch('/add',{method:'POST',
   headers:{'Content-Type':'application/x-www-form-urlencoded'},
   body:'profile='+encodeURIComponent(name)}).then(function(){poll(true);});}
+function backfill(p){
+ if(!confirm('Backfill @'+p+"'s FULL history?\\n\\nRuns a deep pass without fast-update: it walks the entire account from newest to oldest, downloading anything missing. Instagram's own pacing may pause it partway \\u2014 just run backfill again later and it resumes. Queued behind other downloads."))return;
+ showLog();fetch('/backfill',{method:'POST',
+  headers:{'Content-Type':'application/x-www-form-urlencoded'},
+  body:'profile='+encodeURIComponent(p)}).then(function(){poll(true);});}
 function revealFolder(p){fetch('/reveal',{method:'POST',
  headers:{'Content-Type':'application/x-www-form-urlencoded'},
  body:'profile='+encodeURIComponent(p)}).then(function(r){return r.json();}).then(function(d){
@@ -3287,7 +3344,8 @@ function openHelp(){
   +row('⟳ rescan','Re-reads the archive folder from disk. Use after adding, moving, or deleting files outside offgram (e.g. instaloader run by hand).')
   +row('⇪ import all','Copies captions, links, dates &amp; identity from a 4K Stogram database into matching folders. Safe to re-run.')
   +row('⟲ Refresh all','Downloads NEW content for every tracked profile via instaloader, one profile every few minutes in the background. Needs a login (⚙ accounts).')
-  +row('↻ update (on a card)','Same download, but for that one profile, right now.')
+  +row('↻ update (on a card)','Same download, but for that one profile, right now. First clones fetch only the most recent posts (gentler on Instagram).')
+  +row('⏬ backfill (on a card)','Deep pass that walks a profile\\u2019s FULL history and downloads anything missing \\u2014 the follow-up to a capped first clone. Resumable; run it again if Instagram pauses it.')
   +row('🗂 lists','Named groups/tags for organizing profiles; each list becomes a filter chip.')
   +row('📂 (on a card)','Opens that profile\\u2019s folder in Finder / your file manager.')
   +row('▦ select','Multi-select mode \\u2014 pick several profiles to assign to a list or ⤳ merge into one timeline.')
@@ -3525,6 +3583,10 @@ def render_index():
         revb = ("<button class='btn' onclick=\"revealFolder('%s')\" "
                 "title='Show this profile&#39;s folder in your file manager'>"
                 "📂</button>" % pe)
+        bfb = ("<button class='btn' onclick=\"backfill('%s')\" "
+               "title='Deep pass: fetch this profile&#39;s FULL history "
+               "(first clones only grab the most recent %d)'>⏬</button>"
+               % (pe, FIRST_CLONE_COUNT))
         if hid:
             actions = (("<button class='btn' onclick=\"restoreProfile('%s')\">↶ restore"
                         "</button>" % pe)
@@ -3543,7 +3605,7 @@ def render_index():
                        + valb + impb
                        + ("<button class='btn' onclick=\"setTrack('%s','archive')\" "
                           "title='View-only: stop updating'>⊘ archive</button>" % pe)
-                       + listb + revb + rmb)
+                       + listb + revb + bfb + rmb)
             tag = ""
         if merged:
             tag += ("<a class='tag' href='/m/%s' title='Part of a merge'>⤳ merged</a>"
@@ -4215,6 +4277,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     REFRESH["queue"] = []
                 save_refresh()
             return self._send(200, b'{"ok":true}', "application/json")
+        if u.path == "/backfill":
+            p = form.get("profile", [""])[0]
+            if p and p in INDEX["profiles"]:
+                if not (p in JOBS and JOBS[p]["running"]):
+                    threading.Thread(target=run_update, args=([p],),
+                                     kwargs={"deep": True}, daemon=True).start()
+                return self._send(200, b'{"ok":true}', "application/json")
+            return self._send(400, b'{"ok":false}', "application/json")
         if u.path == "/reveal":
             # open the profile's folder in the OS file manager — offgram serves
             # localhost only, so the browser and the files share a machine
