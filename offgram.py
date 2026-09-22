@@ -25,7 +25,7 @@ Design notes:
     thumbnails from them. A pure instaloader archive never uses any of this.
 """
 
-__version__ = "0.5.12"        # single source of truth — pyproject reads this
+__version__ = "0.5.13"        # single source of truth — pyproject reads this
 
 import configparser
 import errno
@@ -2253,6 +2253,39 @@ def seed_stamps(profile):
                         for k, v in newest.items()))
 
 
+def seed_profile_id(profile):
+    """Seed latest-stamps' profile-id from what offgram already knows (identity
+    registry, health checks, 4K Stogram filename ownerids). Instagram throttles
+    its username-resolution endpoints (feedback_required, Sept 2026) while
+    id-based GraphQL lookups keep working — with a stored id, instaloader
+    resolves the profile without ever touching the throttled endpoints."""
+    uid = ((IDENTITY.get(profile) or {}).get("userid")
+           or (HEALTH.get(profile) or {}).get("userid")
+           or profile_userid(profile))
+    if not uid:
+        return
+    cfg = configparser.ConfigParser(strict=False)
+    if STAMPS_FILE.exists():
+        try:
+            cfg.read(STAMPS_FILE)
+        except Exception:                             # noqa: BLE001
+            cfg = configparser.ConfigParser(strict=False)
+    if cfg.has_section(profile) and cfg.has_option(profile, "profile-id"):
+        return
+    if not cfg.has_section(profile):
+        cfg.add_section(profile)
+    cfg.set(profile, "profile-id", str(uid))
+    buf = io.StringIO()
+    cfg.write(buf)
+    _atomic_write_text(STAMPS_FILE, buf.getvalue())
+    job = JOBS.get(profile)
+    if job is not None:
+        job["log"].append(
+            "offgram: seeded profile-id %s from local identity data — the "
+            "update can resolve this profile by id even while Instagram "
+            "throttles username lookups" % uid)
+
+
 UPDATE_LOG_FILE = CACHE_ROOT / "update.log"
 
 
@@ -2323,6 +2356,7 @@ def run_update(profiles, deep=False):
         try:
             if not deep:              # backfill never touches the stamps
                 seed_stamps(profile)
+            seed_profile_id(profile)  # id-based resolution survives throttles
             _run_one(profile, deep=deep)
             # refresh just this profile in the index after download
             try:
