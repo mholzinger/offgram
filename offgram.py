@@ -25,7 +25,7 @@ Design notes:
     thumbnails from them. A pure instaloader archive never uses any of this.
 """
 
-__version__ = "0.5.14"        # single source of truth — pyproject reads this
+__version__ = "0.5.15"        # single source of truth — pyproject reads this
 
 import configparser
 import errno
@@ -2438,6 +2438,21 @@ def run_addpost(code):
             save_index()
         except Exception:                             # noqa: BLE001
             pass
+        # Register the owner so the account becomes trackable BY ID — the post's
+        # metadata carries the owner id for free, and id-based resolution is the
+        # one path that survives Instagram's username-lookup throttling. Makes
+        # short-lived accounts archivable from a single post link: paste one
+        # post, then ↻ update fetches the rest.
+        try:
+            uid = str(post.owner_id)
+        except Exception:                             # noqa: BLE001
+            uid = ""
+        if uid:
+            update_identity(folder, userid=uid, username=owner)
+            seed_profile_id(folder)
+            log.append("offgram: registered @%s (id %s) — ↻ update can now "
+                       "fetch this account even while Instagram throttles "
+                       "username lookups" % (owner, uid))
         rc = 0
     except Exception as exc:                          # noqa: BLE001
         try:
@@ -3216,7 +3231,19 @@ function doSearch(){
   if(!any){var s=document.createElement('span');s.className='sub';
    s.textContent='  (no existing matches)';ab.appendChild(s);}}
  else{ab.style.display='none';}}
-function addSearched(){var q=igName(document.getElementById('search').value);if(q)addProfile(q);}
+function addSearched(){
+ /* Enter must respect what's in the box: a post link saves that post — it must
+    never be mangled into a fake username and archived as a profile */
+ var rawv=document.getElementById('search').value.trim();
+ var pm=rawv.match(/instagram\\.com\\/(?:p|reels?|tv)\\/([A-Za-z0-9_-]{5,20})/);
+ if(pm){addPost(pm[1]);return;}
+ if(rawv.indexOf('instagram.com/stories/')>=0){
+  alert('Story links can\\u2019t be saved by URL \\u2014 stories expire. \\u21bb update the profile while the story is live instead.');return;}
+ if(rawv.indexOf('instagram.com/')>=0){
+  var um=rawv.match(/instagram\\.com\\/([a-z0-9._]{1,30})\\/?\\s*$/);
+  if(um){addProfile(um[1]);return;}
+  alert('Unrecognized Instagram link.');return;}
+ var q=igName(rawv);if(q)addProfile(q);}
 function addProfile(name){name=igName(name);if(!name)return;
  if(!confirm('Start archiving @'+name+' with instaloader? It will download the profile.'))return;
  showLog();fetch('/add',{method:'POST',
@@ -4350,7 +4377,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                               "application/json")
         if u.path == "/add":
             p = form.get("profile", [""])[0].strip().lstrip("@").lower()
-            if p and re.match(r"^[a-z0-9._]{1,40}$", p):
+            if p and re.match(r"^[a-z0-9._]{1,30}$", p):
                 if not (p in JOBS and JOBS[p]["running"]):
                     # run_update downloads then scans the new profile into the index
                     threading.Thread(target=run_update, args=([p],), daemon=True).start()
