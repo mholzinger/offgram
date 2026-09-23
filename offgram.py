@@ -25,7 +25,7 @@ Design notes:
     thumbnails from them. A pure instaloader archive never uses any of this.
 """
 
-__version__ = "0.5.13"        # single source of truth — pyproject reads this
+__version__ = "0.5.14"        # single source of truth — pyproject reads this
 
 import configparser
 import errno
@@ -2388,6 +2388,74 @@ def run_update(profiles, deep=False):
 
 
 # ---------------------------------------------------------------------------
+# Save a single post by link — for grid-hidden posts and trial reels that are
+# live at their /p/ URL but never appear in the profile feed, so no profile
+# update can ever capture them. Downloads in-process (one post is small),
+# routed into the owner's folder, serialized behind the same update lock.
+# ---------------------------------------------------------------------------
+SHORTCODE_RE = re.compile(r"^[A-Za-z0-9_-]{5,20}$")
+
+
+def run_addpost(code):
+    jobname = "post:" + code
+    with JOBS_LOCK:
+        JOBS[jobname] = {"running": True, "queued": True,
+                         "log": _JobLog(jobname), "rc": None}
+    if not UPDATE_LOCK.acquire(blocking=False):
+        with JOBS_LOCK:
+            j = JOBS.get(jobname)
+            if j:
+                j["log"].append("offgram: queued behind another running update")
+        UPDATE_LOCK.acquire()
+    rc = 1
+    try:
+        with JOBS_LOCK:
+            JOBS[jobname]["queued"] = False
+        log = JOBS[jobname]["log"]
+        if not current_login():
+            log.append("offgram: NO INSTAGRAM LOGIN — open ⚙ accounts first.")
+            return
+        import instaloader
+        il = instaloader.Instaloader(
+            quiet=True, dirname_pattern=str(ROOT / "{target}"),
+            download_video_thumbnails=False, max_connection_attempts=1)
+        il.load_session_from_file(current_login())
+        post = instaloader.Post.from_shortcode(il.context, code)
+        owner = post.owner_username
+        # route into the folder already tracking this handle (renames included)
+        folder = next((f for f in INDEX["profiles"]
+                       if identity_handle(f).lower() == owner.lower()), owner)
+        log.append("post %s by @%s (%s, %s) → %s/"
+                   % (code, owner, post.date_utc,
+                      "video" if post.is_video else "image", folder))
+        saved = il.download_post(post, target=folder)
+        log.append("offgram: saved." if saved
+                   else "offgram: nothing written — already in the archive?")
+        try:
+            rec = scan_profile(folder)
+            with INDEX_LOCK:
+                INDEX["profiles"][folder] = rec
+            save_index()
+        except Exception:                             # noqa: BLE001
+            pass
+        rc = 0
+    except Exception as exc:                          # noqa: BLE001
+        try:
+            JOBS[jobname]["log"].append(
+                "offgram: save-by-link failed — %s: %s"
+                % (type(exc).__name__, str(exc)[:200]))
+        except Exception:                             # noqa: BLE001
+            pass
+    finally:
+        UPDATE_LOCK.release()
+        with JOBS_LOCK:
+            j = JOBS.get(jobname)
+            if j:
+                j["running"] = False
+                j["rc"] = rc
+
+
+# ---------------------------------------------------------------------------
 # Refresh engine — a slow, resumable, throttle-aware background job that brings
 # profiles current via instaloader, ONE at a time with a gap between each, so a
 # whole-archive refresh stays cheap and gentle on Instagram. Progress is tracked
@@ -3114,7 +3182,25 @@ function deepCheck(){if(gstatus==='all'){alert('Pick a status filter first (e.g.
  if(!confirm('Deep-check the \\''+gstatus+'\\' accounts with the authenticated API? Burns IG calls only on that bucket.'))return;
  fetch('/heartbeat',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
   body:'action=start&status='+encodeURIComponent(gstatus)}).then(function(){setTimeout(livePoll,300);});}
-function doSearch(){var q=igName(document.getElementById('search').value);
+function addPost(code){showLog();fetch('/addpost',{method:'POST',
+ headers:{'Content-Type':'application/x-www-form-urlencoded'},
+ body:'code='+encodeURIComponent(code)}).then(function(r){return r.json();}).then(function(d){
+  if(!d.ok){alert('Could not save post: '+(d.note||'unknown'));return;}
+  poll(true);}).catch(function(){alert('Save-post request failed.');});}
+function doSearch(){
+ var rawv=document.getElementById('search').value.trim();
+ var pm=rawv.match(/instagram\\.com\\/(?:p|reels?|tv)\\/([A-Za-z0-9_-]{5,20})/);
+ var ab0=document.getElementById('addbar');
+ if(pm){ab0.textContent='';ab0.style.display='block';
+  var sp0=document.createElement('span');
+  sp0.innerHTML='Instagram post link \\u2014 works even for posts hidden from the profile grid: <b>'+escapeHTML(pm[1])+'</b> &nbsp; ';
+  var b0=document.createElement('button');b0.className='btn go';
+  b0.textContent='\\u2b07 Save post to its owner\\u2019s folder';
+  b0.onclick=function(){addPost(pm[1]);};
+  ab0.appendChild(sp0);ab0.appendChild(b0);return;}
+ if(rawv.indexOf('instagram.com/stories/')>=0){ab0.style.display='block';
+  ab0.textContent='Story links can\\u2019t be saved by URL \\u2014 stories expire. \\u21bb update the profile while the story is live instead.';return;}
+ var q=igName(document.getElementById('search').value);
  var cards=document.querySelectorAll('.card'),any=false,exact=false;
  cards.forEach(function(c){var n=c.getAttribute('data-name')||'';
   var st=c.getAttribute('data-status')||'unchecked';
@@ -3382,6 +3468,7 @@ function openHelp(){
   +row('⏬ backfill (on a card)','Deep pass that walks a profile\\u2019s FULL history and downloads anything missing \\u2014 the follow-up to a capped first clone. Resumable; run it again if Instagram pauses it.')
   +row('🗂 lists','Named groups/tags for organizing profiles; each list becomes a filter chip.')
   +row('📂 (on a card)','Opens that profile\\u2019s folder in Finder / your file manager.')
+  +row('⬇ save by link','Paste an instagram.com/p/\\u2026 or /reel/\\u2026 URL into the search box to save that single post into its owner\\u2019s folder \\u2014 catches posts hidden from the profile grid.')
   +row('▦ select','Multi-select mode \\u2014 pick several profiles to assign to a list or ⤳ merge into one timeline.')
   +row('💾 backup','Snapshot every offgram setting into a restorable .tar.gz. Your archive files are never included or touched.')
   +row('⚙ accounts','Manage Instagram logins: import a session from a logged-in browser (easiest), test, switch, sign out.')
@@ -4319,6 +4406,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                      kwargs={"deep": True}, daemon=True).start()
                 return self._send(200, b'{"ok":true}', "application/json")
             return self._send(400, b'{"ok":false}', "application/json")
+        if u.path == "/addpost":
+            code = form.get("code", [""])[0].strip()
+            if not SHORTCODE_RE.match(code):
+                return self._send(400, b'{"ok":false,"note":"bad shortcode"}',
+                                  "application/json")
+            if "post:" + code in JOBS and JOBS["post:" + code]["running"]:
+                return self._send(200, b'{"ok":true}', "application/json")
+            threading.Thread(target=run_addpost, args=(code,), daemon=True).start()
+            return self._send(200, b'{"ok":true}', "application/json")
         if u.path == "/reveal":
             # open the profile's folder in the OS file manager — offgram serves
             # localhost only, so the browser and the files share a machine
