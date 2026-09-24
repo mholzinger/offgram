@@ -25,7 +25,7 @@ Design notes:
     thumbnails from them. A pure instaloader archive never uses any of this.
 """
 
-__version__ = "0.5.15"        # single source of truth — pyproject reads this
+__version__ = "0.5.16"        # single source of truth — pyproject reads this
 
 import configparser
 import errno
@@ -974,8 +974,17 @@ def import_cookies_worker(browser, username):
         if new:
             log.append("offgram: imported session(s): %s" % ", ".join(new))
         elif any("browser_cookie3" in l for l in log):
-            log.append("offgram: the cookie reader is missing — install it once with"
-                       "  pip install browser_cookie3  (then retry).")
+            if "pipx" in sys.executable:
+                log.append("offgram: the cookie reader is missing — with a pipx "
+                           "install it must go INTO offgram's venv:  "
+                           "pipx inject offgram browser_cookie3  (then retry). "
+                           "Plain 'pipx install browser_cookie3' makes a separate "
+                           "venv offgram can't see.")
+            else:
+                log.append("offgram: the cookie reader is missing — install it "
+                           "into offgram's environment:  %s -m pip install "
+                           "browser_cookie3  (then retry)."
+                           % sys.executable)
         elif proc.returncode == 0:
             log.append("offgram: no new session appeared — make sure you're logged "
                        "into Instagram in that browser. Firefox/Chrome are most "
@@ -3026,7 +3035,9 @@ function refreshAll(){if(!confirm('Refresh the whole archive via instaloader? It
  refreshCtl('start');}
 function refreshCtl(a){fetch('/refresh',{method:'POST',
  headers:{'Content-Type':'application/x-www-form-urlencoded'},
- body:'action='+a}).then(function(){setTimeout(livePoll,300);});}
+ body:'action='+a}).then(function(r){return r.json();}).then(function(d){
+  if(d&&d.ok===false){alert('Refresh not started: '+(d.note||'unknown'));return;}
+  setTimeout(livePoll,300);}).catch(function(){setTimeout(livePoll,300);});}
 /* Live-update just the progress banner via polling — no full-page reload, so
    browsing/scroll/lightbox are never interrupted. Index only. */
 var _liveLoop=false,_liveHTML=null;
@@ -4411,6 +4422,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if u.path == "/refresh":
             action = form.get("action", ["start"])[0]
             if action == "start":
+                if not current_login():
+                    # without a session every queued job would fail-fast quietly,
+                    # which reads as "Refresh All does nothing"
+                    return self._send(400, json.dumps(
+                        {"ok": False, "note": "no Instagram login — open "
+                         "⚙ accounts and import a session from your browser "
+                         "first"}).encode(), "application/json")
                 start_refresh(None)
             elif action == "pause":
                 REFRESH["paused"] = True

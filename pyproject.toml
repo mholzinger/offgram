@@ -23,6 +23,9 @@ classifiers = [
 # patched instaloader fork (stock 4.15.1 is broken against current Instagram).
 dependencies = [
     "instaloader @ git+https://github.com/mholzinger/instaloader@offgram-stable",
+    # cookie reader for ⚙ accounts → import-from-browser, the recommended login
+    # path; bundled so pipx users don't need a separate inject step
+    "browser-cookie3",
 ]
 
 [project.urls]

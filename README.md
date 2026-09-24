@@ -118,7 +118,7 @@ instaloader --login YOUR_USERNAME
 
 If you already have a saved session, offgram uses it automatically — `INSTALOADER_LOGIN` only matters for choosing between several. Without any login, updates fail fast with a clear message instead of Instagram's misleading anonymous-request errors.
 
-Add more accounts the same way — they appear in the in-app account switcher. Or skip the CLI entirely: in the running app, **⚙ accounts → import** pulls a session straight from a logged-in browser (`--load-cookies`), no password or 2FA required. Browser import needs the optional `browser_cookie3` package (`pip install browser_cookie3`); **Firefox or Chrome are the most reliable** — Safari cookie access is flaky on macOS.
+Add more accounts the same way — they appear in the in-app account switcher. Or skip the CLI entirely: in the running app, **⚙ accounts → import** pulls a session straight from a logged-in browser (`--load-cookies`), no password or 2FA required. The cookie reader (`browser-cookie3`) ships with offgram as of v0.5.16; on an older install add it with `pipx inject offgram browser_cookie3` (NOT `pipx install`, which makes a separate venv offgram can't see). **Firefox or Chrome are the most reliable** — Safari cookie access is flaky on macOS.
 
 ### Environment variables (override config)
 
