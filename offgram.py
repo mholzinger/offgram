@@ -25,7 +25,7 @@ Design notes:
     thumbnails from them. A pure instaloader archive never uses any of this.
 """
 
-__version__ = "0.5.16"        # single source of truth — pyproject reads this
+__version__ = "0.5.17"        # single source of truth — pyproject reads this
 
 import configparser
 import errno
@@ -2488,7 +2488,7 @@ def run_addpost(code):
 REFRESH_FILE = CACHE_ROOT / "refresh.json"
 REFRESH_INTERVAL = float(os.environ.get("OFFGRAM_REFRESH_INTERVAL", "180"))
 REFRESH = {"running": False, "paused": False, "stop": False, "current": "",
-           "queue": [], "done": 0, "total": 0, "failed": []}
+           "queue": [], "done": 0, "total": 0, "failed": [], "wait_until": 0}
 REFRESH_LOCK = threading.Lock()
 
 
@@ -2516,7 +2516,8 @@ def refresh_snapshot():
     return {"running": REFRESH["running"], "paused": REFRESH["paused"],
             "current": REFRESH["current"], "done": REFRESH["done"],
             "total": REFRESH["total"], "queued": len(REFRESH["queue"]),
-            "failed": len(REFRESH["failed"])}
+            "failed": len(REFRESH["failed"]),
+            "wait": max(0, int(REFRESH.get("wait_until", 0) - time.time()))}
 
 
 def refresh_worker():
@@ -2543,9 +2544,11 @@ def refresh_worker():
             REFRESH["current"] = ""
             save_refresh()
             waited = 0.0                               # interruptible gap before next
+            REFRESH["wait_until"] = time.time() + REFRESH_INTERVAL
             while waited < REFRESH_INTERVAL and not REFRESH["stop"] and REFRESH["queue"]:
                 time.sleep(1)
                 waited += 1
+            REFRESH["wait_until"] = 0
     finally:
         REFRESH["running"], REFRESH["current"] = False, ""
         save_refresh()
@@ -2984,6 +2987,11 @@ function showLog(){document.getElementById('log').style.display='block';
 function closeLog(){document.getElementById('log').style.display='none';
  try{localStorage.setItem('og_log','0');}catch(e){}}
 function renderLog(j){var lines=[],jobs=(j&&j.jobs)||{};
+ var rf=(j&&j.refresh)||{};
+ if(rf.running||rf.queued){
+  var st=rf.paused?'paused':(rf.current?('now @'+rf.current):(rf.wait?('resting '+rf.wait+'s before the next profile'):'running'));
+  lines.push('### \u27f2 Refresh all \u2014 '+(rf.done||0)+'/'+(rf.total||0)+' \u00b7 '+st+' \u00b7 '+(rf.queued||0)+' queued'+((rf.failed||0)?(' \u00b7 '+rf.failed+' failed'):''));
+  lines.push('');}
  for(var k in jobs){lines.push('### '+k+(jobs[k].running?(jobs[k].queued?' (queued — waiting its turn)':' (running)'):' (done)'));
   lines.push(jobs[k].log.slice(-20).join('\\n'));}
  document.getElementById('logbody').textContent=lines.length?lines.join('\\n')
@@ -3578,6 +3586,8 @@ def refresh_banner():
                "<button class='btn' onclick=\"refreshCtl('stop')\">■ clear</button>")
         state = "paused (queued from before)"
     cur = (" · now <b>%s</b>" % html.escape(s["current"])) if s["current"] else ""
+    if not cur and s["running"] and not s["paused"] and s.get("wait", 0) > 0:
+        cur = " · resting %ds before the next profile" % s["wait"]
     fail = (" · %d failed" % s["failed"]) if s["failed"] else ""
     return ("<div class='banner'>Refreshing archive — %d/%d (%d%%) · %s%s%s "
             "&nbsp; %s</div>" % (s["done"], s["total"], pct, state, cur, fail, ctl))
@@ -4429,6 +4439,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         {"ok": False, "note": "no Instagram login — open "
                          "⚙ accounts and import a session from your browser "
                          "first"}).encode(), "application/json")
+                eligible = [p for p in INDEX["profiles"]
+                            if HEALTH.get(p, {}).get("status") != "dead"
+                            and not is_archived(p) and not is_hidden_profile(p)]
+                if not eligible:
+                    # an empty queue "finishes" instantly and shows nothing
+                    return self._send(400, json.dumps(
+                        {"ok": False, "note": "nothing eligible to refresh — "
+                         "every profile is marked dead, archive-only, or "
+                         "hidden"}).encode(), "application/json")
                 start_refresh(None)
             elif action == "pause":
                 REFRESH["paused"] = True
