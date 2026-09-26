@@ -25,7 +25,7 @@ Design notes:
     thumbnails from them. A pure instaloader archive never uses any of this.
 """
 
-__version__ = "0.5.17"        # single source of truth — pyproject reads this
+__version__ = "0.5.18"        # single source of truth — pyproject reads this
 
 import configparser
 import errno
@@ -1738,8 +1738,11 @@ def check_one(name):
         p = instaloader.Profile.from_username(loader.context, name)
         return {"status": "private" if p.is_private else "alive",
                 "checked": now, "userid": str(p.userid)}
-    except instaloader.ProfileNotExistsException:
-        uid = profile_userid(name)
+    except instaloader.ProfileNotExistsException as err:
+        # every known source of a stable id, not just 4K Stogram filenames
+        uid = ((IDENTITY.get(name) or {}).get("userid")
+               or (HEALTH.get(name) or {}).get("userid")
+               or profile_userid(name))
         if uid:
             try:
                 p = instaloader.Profile.from_id(loader.context, int(uid))
@@ -1749,8 +1752,18 @@ def check_one(name):
                 return {"status": "private" if p.is_private else "alive",
                         "checked": now, "userid": str(p.userid)}
             except Exception:                         # noqa: BLE001
-                return {"status": "dead", "checked": now}
-        return {"status": "dead", "checked": now}
+                pass                                  # fall through to the tiebreaker
+        # A failed username lookup is NOT proof of death — Instagram throttles
+        # exactly these endpoints, and a wrong "dead" silently excludes the
+        # profile from every future update. Ask the public page before judging.
+        pub = quick_check_one(name)
+        if pub.get("status") == "alive":
+            return {"status": "alive", "checked": now, "method": "public-page",
+                    "note": "public page is live; API lookup unavailable"}
+        if pub.get("status") == "dead":
+            return {"status": "dead", "checked": now}
+        return {"status": "error", "checked": now,
+                "note": "lookup unavailable — %s" % str(err)[:90]}
     except Exception as exc:                          # noqa: BLE001
         return {"status": "error", "checked": now, "note": str(exc)[:140]}
 
@@ -1847,8 +1860,17 @@ def quick_check_one(name):
             head = r.read(60000).decode("utf-8", "replace")  # <head> only; close early
         alive = ('property="og:title"' in head
                  or ("(@" + name.lower() + ")") in head.lower())
-        return {"status": "alive" if alive else "dead", "checked": now,
-                "method": "quick"}
+        if alive:
+            return {"status": "alive", "checked": now, "method": "quick"}
+        # 200 without profile markup is a login wall or an app shell, which
+        # looks identical to a deleted account — never call that dead
+        return {"status": "error", "checked": now, "method": "quick",
+                "note": "no profile markup (login wall?) — inconclusive"}
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:                               # the one proof of absence
+            return {"status": "dead", "checked": now, "method": "quick"}
+        return {"status": "error", "checked": now, "method": "quick",
+                "note": "HTTP %s" % exc.code}
     except Exception as exc:                              # noqa: BLE001
         return {"status": "error", "checked": now, "method": "quick",
                 "note": str(exc)[:120]}
@@ -3044,7 +3066,13 @@ function refreshAll(){if(!confirm('Refresh the whole archive via instaloader? It
 function refreshCtl(a){fetch('/refresh',{method:'POST',
  headers:{'Content-Type':'application/x-www-form-urlencoded'},
  body:'action='+a}).then(function(r){return r.json();}).then(function(d){
-  if(d&&d.ok===false){alert('Refresh not started: '+(d.note||'unknown'));return;}
+  if(d&&d.ok===false){
+   if(d.dead&&d.dead>0&&confirm('All '+d.dead+' profile(s) are marked dead, so there is nothing to refresh.\\n\\n'
+    +'Instagram throttling can mark profiles dead by mistake. Clear those marks and refresh anyway?\\n\\n'
+    +'(Each profile gets re-checked as it is refreshed.)')){
+    fetch('/refresh',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
+     body:'action=start&include_dead=1'}).then(function(){location.reload();});return;}
+   alert('Refresh not started: '+(d.note||'unknown'));return;}
   setTimeout(livePoll,300);}).catch(function(){setTimeout(livePoll,300);});}
 /* Live-update just the progress banner via polling — no full-page reload, so
    browsing/scroll/lightbox are never interrupted. Index only. */
@@ -4439,16 +4467,31 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         {"ok": False, "note": "no Instagram login — open "
                          "⚙ accounts and import a session from your browser "
                          "first"}).encode(), "application/json")
-                eligible = [p for p in INDEX["profiles"]
-                            if HEALTH.get(p, {}).get("status") != "dead"
-                            and not is_archived(p) and not is_hidden_profile(p)]
+                live = [p for p in INDEX["profiles"]
+                        if not is_archived(p) and not is_hidden_profile(p)]
+                eligible = [p for p in live
+                            if HEALTH.get(p, {}).get("status") != "dead"]
+                if not eligible and live and form.get("include_dead", [""])[0] == "1":
+                    # Instagram throttling can mark a whole archive dead by
+                    # mistake; clearing the verdicts lets the refresh re-prove
+                    # each profile instead of skipping it forever
+                    for p in live:
+                        if HEALTH.get(p, {}).get("status") == "dead":
+                            HEALTH.pop(p, None)
+                    save_health()
+                    eligible = live
                 if not eligible:
                     # an empty queue "finishes" instantly and shows nothing
+                    n_dead = sum(1 for p in live
+                                 if HEALTH.get(p, {}).get("status") == "dead")
                     return self._send(400, json.dumps(
-                        {"ok": False, "note": "nothing eligible to refresh — "
-                         "every profile is marked dead, archive-only, or "
-                         "hidden"}).encode(), "application/json")
-                start_refresh(None)
+                        {"ok": False, "dead": n_dead, "live": len(live),
+                         "note": ("nothing eligible to refresh — %d profile(s) "
+                                  "are marked dead" % n_dead) if n_dead else
+                                 ("nothing eligible to refresh — every profile "
+                                  "is archive-only or hidden")}).encode(),
+                        "application/json")
+                start_refresh(eligible)
             elif action == "pause":
                 REFRESH["paused"] = True
             elif action == "resume":
