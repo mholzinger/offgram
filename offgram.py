@@ -25,7 +25,7 @@ Design notes:
     thumbnails from them. A pure instaloader archive never uses any of this.
 """
 
-__version__ = "0.5.18"        # single source of truth — pyproject reads this
+__version__ = "0.5.19"        # single source of truth — pyproject reads this
 
 import configparser
 import errno
@@ -2628,6 +2628,14 @@ def _il_run(folder, target, dirpat, flags, extra=None, deep=False):
             line = line.rstrip("\n")
             if line:
                 log.append(line)
+                if ("could not be retrieved by its name, but by its ID" in line
+                        and not JOBS[folder].get("_byid_noted")):
+                    JOBS[folder]["_byid_noted"] = True
+                    log.append(
+                        "offgram: ^ that warning is expected right now — "
+                        "Instagram is throttling username lookups, so the "
+                        "profile was resolved by its stored id instead. "
+                        "Nothing is missing or wrong.")
                 if len(log) > 500:
                     del log[:len(log) - 500]
         proc.wait()
@@ -3013,6 +3021,11 @@ function renderLog(j){var lines=[],jobs=(j&&j.jobs)||{};
  if(rf.running||rf.queued){
   var st=rf.paused?'paused':(rf.current?('now @'+rf.current):(rf.wait?('resting '+rf.wait+'s before the next profile'):'running'));
   lines.push('### \u27f2 Refresh all \u2014 '+(rf.done||0)+'/'+(rf.total||0)+' \u00b7 '+st+' \u00b7 '+(rf.queued||0)+' queued'+((rf.failed||0)?(' \u00b7 '+rf.failed+' failed'):''));
+  lines.push('');}
+ var sc=(j&&j.scan)||{};
+ if(sc.running){
+  lines.push('### \u27f3 Rescan \u2014 reading folders from disk: '+(sc.done||0)+'/'+(sc.total||0)
+   +(sc.current?(' \u00b7 now '+sc.current):''));
   lines.push('');}
  for(var k in jobs){lines.push('### '+k+(jobs[k].running?(jobs[k].queued?' (queued — waiting its turn)':' (running)'):' (done)'));
   lines.push(jobs[k].log.slice(-20).join('\\n'));}
