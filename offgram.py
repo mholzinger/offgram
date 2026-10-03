@@ -25,7 +25,7 @@ Design notes:
     thumbnails from them. A pure instaloader archive never uses any of this.
 """
 
-__version__ = "0.5.20"        # single source of truth — pyproject reads this
+__version__ = "0.5.21"        # single source of truth — pyproject reads this
 
 import configparser
 import errno
@@ -2956,16 +2956,17 @@ body.hidesrc .srctag{display:none}
  padding:0 18px;user-select:none;transform:translateY(-50%)}
 #lb .nav.l{left:0}#lb .nav.r{right:0}
 #lb .close{position:fixed;top:14px;right:20px;font-size:30px;cursor:pointer}
-#lb .mute{position:fixed;top:16px;left:20px;font-size:24px;cursor:pointer;
- user-select:none;display:none;z-index:55;line-height:1}
-#vctl{position:fixed;top:12px;left:58px;z-index:55;display:none;align-items:center;
- gap:10px;background:rgba(22,22,26,.92);border:1px solid #2a2a32;border-radius:8px;
- padding:6px 10px;font-size:13px;color:#c9c9d0}
+#vctl{flex:none;display:none;align-items:center;gap:10px;width:100%;
+ box-sizing:border-box;background:#16161a;border-top:1px solid #26262c;
+ padding:8px 16px;font-size:13px;color:#c9c9d0}
 #vctl button{background:#1c1c22;border:1px solid #2a2a32;border-radius:6px;
- color:#e7e7ea;padding:3px 9px;font-size:14px;cursor:pointer;line-height:1.3}
+ color:#e7e7ea;padding:4px 10px;font-size:14px;cursor:pointer;line-height:1.3}
 #vctl button:hover{background:#262630}
-#vctl input[type=range]{width:110px;accent-color:#539bf5;vertical-align:middle}
-#vctl .vlab{color:#8b949e;white-space:nowrap}
+#vctl input[type=range]{accent-color:#539bf5;vertical-align:middle;cursor:pointer}
+#vctl #vseek{flex:1;min-width:80px}
+#vctl #vbright{width:90px;flex:none}
+#vctl .vlab{color:#8b949e;white-space:nowrap;font-variant-numeric:tabular-nums}
+#vctl .vsep{width:1px;height:18px;background:#2a2a32;flex:none}
 """
 
 JS_COMMON = """
@@ -3005,8 +3006,36 @@ function stepFrame(dir){var v=curVideo();if(!v)return;
 function applyVideoChrome(show){var c=document.getElementById('vctl');
  if(c)c.style.display=show?'flex':'none';
  if(show)applyBright();}
-function applyMuteBtn(show){var b=document.getElementById('mute');if(!b)return;
- b.style.display=show?'block':'none';b.textContent=MUTED?'🔇':'🔊';
+/* Own transport controls: every browser dims the picture behind its native
+   controls, so offgram renders no native controls at all and drives the video
+   from this always-visible bar instead. */
+function fmtTime(t){t=Math.max(0,t||0);var m=Math.floor(t/60),sec=Math.floor(t%60);
+ return m+':'+(sec<10?'0':'')+sec;}
+function updPlayBtn(){var b=document.getElementById('vplay'),v=curVideo();
+ if(b)b.textContent=(v&&!v.paused)?'⏸':'▶';}
+function updSeek(){var v=curVideo();if(!v)return;
+ var d=isFinite(v.duration)?v.duration:0;
+ var sk=document.getElementById('vseek');
+ if(sk)sk.value=d?Math.round(v.currentTime/d*1000):0;
+ var t=document.getElementById('vtime');if(t)t.textContent=fmtTime(v.currentTime);
+ var du=document.getElementById('vdur');if(du)du.textContent=fmtTime(d);}
+function seekTo(val){var v=curVideo();if(!v)return;
+ var d=isFinite(v.duration)?v.duration:0;if(!d)return;
+ v.currentTime=(+val)/1000*d;
+ var t=document.getElementById('vtime');if(t)t.textContent=fmtTime(v.currentTime);}
+function togglePlay(){var v=curVideo();if(!v)return;
+ if(v.paused){var p=v.play();if(p&&p.catch)p.catch(function(){});}else{v.pause();}
+ updPlayBtn();}
+function togglePiP(){var v=curVideo();if(!v)return;
+ try{
+  if(document.pictureInPictureElement){document.exitPictureInPicture();}
+  else if(v.requestPictureInPicture){v.requestPictureInPicture();}
+  else if(v.webkitSetPresentationMode){
+   v.webkitSetPresentationMode(v.webkitPresentationMode==='picture-in-picture'
+    ?'inline':'picture-in-picture');}
+ }catch(e){}}
+function applyMuteBtn(show){var b=document.getElementById('vmute');if(!b)return;
+ b.textContent=MUTED?'🔇':'🔊';
  b.title=MUTED?'Muted — click for sound':'Sound on — click to mute';}
 function toggleMute(){MUTED=!MUTED;try{localStorage.setItem('og_muted',MUTED?'1':'0');}catch(e){}
  var v=document.querySelector('#lb .stage video');if(v){v.muted=MUTED;if(!MUTED){var p=v.play();if(p&&p.catch)p.catch(function(){});}}
@@ -3021,7 +3050,7 @@ function escapeHTML(s){return s.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>'
 function renderLB(){let it=ITEMS[cur];let s=document.querySelector('#lb .stage');
  let m='/media?p='+encodeURIComponent(it.rel);
  s.innerHTML=it.kind==='video'
-  ?'<video src="'+m+'" controls autoplay playsinline'+(MUTED?' muted':'')+'></video>'
+  ?'<video src="'+m+'" autoplay playsinline'+(MUTED?' muted':'')+'></video>'
   :'<img src="'+m+'">';
  var m0=s.querySelector('img,video');
  if(m0)m0.onerror=function(){s.innerHTML='<div class="miss">⚠ Could not load this file from the archive'
@@ -3030,7 +3059,11 @@ function renderLB(){let it=ITEMS[cur];let s=document.querySelector('#lb .stage')
   +'disconnected drive, moved folder, or a cloud placeholder not downloaded yet. '
   +'The offgram terminal shows the exact reason.</span></div>';};
  if(it.kind==='video'){var v=s.querySelector('video');
-  if(v){v.muted=MUTED;FRAMEDUR=1/30;setFpsLabel(null);watchFps(v);}}
+  if(v){v.muted=MUTED;FRAMEDUR=1/30;setFpsLabel(null);watchFps(v);
+   v.onclick=togglePlay;
+   v.onplay=updPlayBtn;v.onpause=updPlayBtn;
+   v.ontimeupdate=updSeek;v.onloadedmetadata=updSeek;v.onseeked=updSeek;
+   applyBright();updPlayBtn();updSeek();}}
  applyMuteBtn(it.kind==='video');
  applyVideoChrome(it.kind==='video');
  let when=it.ts?new Date(it.ts*1000).toLocaleString():'';
@@ -3056,7 +3089,9 @@ document.addEventListener('keydown',e=>{
  if(document.getElementById('lb').style.display!=='flex')return;
  if(e.key==='Escape')closeLB();if(e.key==='ArrowLeft')step(-1);if(e.key==='ArrowRight')step(1);
  if(e.key===','){stepFrame(-1);e.preventDefault();}
- if(e.key==='.'){stepFrame(1);e.preventDefault();}});
+ if(e.key==='.'){stepFrame(1);e.preventDefault();}
+ if(e.key===' '&&!/INPUT|TEXTAREA/.test((e.target||{}).tagName||'')){
+  togglePlay();e.preventDefault();}});
 /* Log panel visibility persists across the automatic page reloads that follow
    finished updates — otherwise the panel "keeps closing" mid-session. */
 function showLog(){document.getElementById('log').style.display='block';
@@ -3637,18 +3672,25 @@ def page(title, body, extra_js=""):
             "<meta name='viewport' content='width=device-width,initial-scale=1'>"
             "<title>%s</title><style>%s</style></head><body>%s"
             "<div id='lb'><span class='close' onclick='closeLB()'>×</span>"
-            "<span class='mute' id='mute' onclick='toggleMute()'></span>"
-            "<div id='vctl'>"
-            "<button onclick='stepFrame(-1)' title='Previous frame (,)'>\u23ee</button>"
-            "<button onclick='stepFrame(1)' title='Next frame (.)'>\u23ed</button>"
-            "<span class='vlab' id='vfps'></span>"
-            "<span class='vlab'>\u2600</span>"
-            "<input type='range' id='vbright' min='100' max='200' step='5' "
-            "oninput='setBright(this.value)' title='Brightness'>"
-            "<span class='vlab' id='vbrightval'></span></div>"
             "<span class='nav l' onclick='step(-1)'>‹</span>"
             "<span class='nav r' onclick='step(1)'>›</span>"
-            "<div class='stage'></div><div class='cap' id='cap'></div></div>"
+            "<div class='stage'></div>"
+            "<div id='vctl'>"
+            "<button id='vplay' onclick='togglePlay()' title='Play / pause (space)'>▶</button>"
+            "<button onclick='stepFrame(-1)' title='Previous frame (,)'>⏮</button>"
+            "<button onclick='stepFrame(1)' title='Next frame (.)'>⏭</button>"
+            "<span class='vlab' id='vtime'>0:00</span>"
+            "<input type='range' id='vseek' min='0' max='1000' value='0' step='1' "
+            "oninput='seekTo(this.value)' title='Seek'>"
+            "<span class='vlab' id='vdur'>0:00</span>"
+            "<span class='vlab' id='vfps'></span><span class='vsep'></span>"
+            "<button id='vmute' onclick='toggleMute()' title='Mute / unmute'>\U0001f507</button>"
+            "<span class='vlab'>☀</span>"
+            "<input type='range' id='vbright' min='100' max='200' step='5' "
+            "oninput='setBright(this.value)' title='Brightness'>"
+            "<span class='vlab' id='vbrightval'></span>"
+            "<button id='vpip' onclick='togglePiP()' title='Picture in picture'>⧉</button>"
+            "</div><div class='cap' id='cap'></div></div>"
             "<div id='log'><div class='loghdr'>activity log"
             "<span class='x' onclick='closeLog()'>×</span></div>"
             "<div id='logbody'></div></div>"
