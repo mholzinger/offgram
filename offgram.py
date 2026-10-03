@@ -25,7 +25,7 @@ Design notes:
     thumbnails from them. A pure instaloader archive never uses any of this.
 """
 
-__version__ = "0.5.19"        # single source of truth — pyproject reads this
+__version__ = "0.5.20"        # single source of truth — pyproject reads this
 
 import configparser
 import errno
@@ -2958,11 +2958,53 @@ body.hidesrc .srctag{display:none}
 #lb .close{position:fixed;top:14px;right:20px;font-size:30px;cursor:pointer}
 #lb .mute{position:fixed;top:16px;left:20px;font-size:24px;cursor:pointer;
  user-select:none;display:none;z-index:55;line-height:1}
+#vctl{position:fixed;top:12px;left:58px;z-index:55;display:none;align-items:center;
+ gap:10px;background:rgba(22,22,26,.92);border:1px solid #2a2a32;border-radius:8px;
+ padding:6px 10px;font-size:13px;color:#c9c9d0}
+#vctl button{background:#1c1c22;border:1px solid #2a2a32;border-radius:6px;
+ color:#e7e7ea;padding:3px 9px;font-size:14px;cursor:pointer;line-height:1.3}
+#vctl button:hover{background:#262630}
+#vctl input[type=range]{width:110px;accent-color:#539bf5;vertical-align:middle}
+#vctl .vlab{color:#8b949e;white-space:nowrap}
 """
 
 JS_COMMON = """
 let ITEMS=[],cur=0;
 var MUTED=true;try{MUTED=localStorage.getItem('og_muted')!=='0';}catch(e){}  /* default: muted */
+/* Video brightness: Instagram re-encodes tend to render dark in-browser, so the
+   player lifts them by default. Remembered per viewer like the mute choice. */
+var BRIGHT=1.3;try{var _b=parseFloat(localStorage.getItem('og_bright'));
+ if(_b>=1&&_b<=2)BRIGHT=_b;}catch(e){}
+/* Frame stepping: no native API exists, but requestVideoFrameCallback reports
+   each frame's mediaTime, so the real frame duration is measured rather than
+   assumed. Browsers without it (Firefox) fall back to 30fps. */
+var FRAMEDUR=1/30;
+function curVideo(){return document.querySelector('#lb .stage video');}
+function applyBright(){var v=curVideo();if(v)v.style.filter='brightness('+BRIGHT+')';
+ var sl=document.getElementById('vbright');if(sl)sl.value=Math.round(BRIGHT*100);
+ var lb=document.getElementById('vbrightval');if(lb)lb.textContent=Math.round(BRIGHT*100)+'%';}
+function setBright(pct){BRIGHT=Math.max(1,Math.min(2,(+pct||100)/100));
+ try{localStorage.setItem('og_bright',BRIGHT);}catch(e){}applyBright();}
+function setFpsLabel(fps){var e=document.getElementById('vfps');
+ if(e)e.textContent=fps?(fps+'fps'):'~30fps';}
+function watchFps(v){
+ if(!v.requestVideoFrameCallback){setFpsLabel(null);return;}
+ var last=null,samples=[];
+ function cb(now,meta){
+  if(last!==null){var d=meta.mediaTime-last;if(d>0.004&&d<0.2)samples.push(d);}
+  last=meta.mediaTime;
+  if(samples.length>=3){samples.sort(function(a,b){return a-b;});
+   FRAMEDUR=samples[Math.floor(samples.length/2)];
+   setFpsLabel(Math.round(1/FRAMEDUR));return;}
+  if(curVideo()===v)v.requestVideoFrameCallback(cb);}
+ v.requestVideoFrameCallback(cb);}
+function stepFrame(dir){var v=curVideo();if(!v)return;
+ if(!v.paused)v.pause();
+ var dur=isFinite(v.duration)?v.duration:1e9;
+ v.currentTime=Math.max(0,Math.min(dur-0.001,v.currentTime+dir*FRAMEDUR));}
+function applyVideoChrome(show){var c=document.getElementById('vctl');
+ if(c)c.style.display=show?'flex':'none';
+ if(show)applyBright();}
 function applyMuteBtn(show){var b=document.getElementById('mute');if(!b)return;
  b.style.display=show?'block':'none';b.textContent=MUTED?'🔇':'🔊';
  b.title=MUTED?'Muted — click for sound':'Sound on — click to mute';}
@@ -2971,6 +3013,7 @@ function toggleMute(){MUTED=!MUTED;try{localStorage.setItem('og_muted',MUTED?'1'
  applyMuteBtn(true);}
 function openLB(i){cur=i;renderLB();document.getElementById('lb').style.display='flex';}
 function closeLB(){document.getElementById('lb').style.display='none';
+ applyVideoChrome(false);
  let s=document.querySelector('#lb .stage');
  if(s){var v=s.querySelector('video');if(v){v.pause();v.removeAttribute('src');v.load();}s.innerHTML='';}}
 function step(d){cur=(cur+d+ITEMS.length)%ITEMS.length;renderLB();}
@@ -2986,8 +3029,10 @@ function renderLB(){let it=ITEMS[cur];let s=document.querySelector('#lb .stage')
   +'<br><span class="sub">The thumbnail is cached, but the original file is missing or unreadable — '
   +'disconnected drive, moved folder, or a cloud placeholder not downloaded yet. '
   +'The offgram terminal shows the exact reason.</span></div>';};
- if(it.kind==='video'){var v=s.querySelector('video');if(v)v.muted=MUTED;}
+ if(it.kind==='video'){var v=s.querySelector('video');
+  if(v){v.muted=MUTED;FRAMEDUR=1/30;setFpsLabel(null);watchFps(v);}}
  applyMuteBtn(it.kind==='video');
+ applyVideoChrome(it.kind==='video');
  let when=it.ts?new Date(it.ts*1000).toLocaleString():'';
  let link=it.url?' &nbsp;·&nbsp; <a href="'+it.url+'" target="_blank">open original ↗</a>':'';
  let cap=document.getElementById('cap');
@@ -3009,7 +3054,9 @@ function renderLB(){let it=ITEMS[cur];let s=document.querySelector('#lb .stage')
    if(ITEMS[cur]===it)renderLB();});}}
 document.addEventListener('keydown',e=>{
  if(document.getElementById('lb').style.display!=='flex')return;
- if(e.key==='Escape')closeLB();if(e.key==='ArrowLeft')step(-1);if(e.key==='ArrowRight')step(1);});
+ if(e.key==='Escape')closeLB();if(e.key==='ArrowLeft')step(-1);if(e.key==='ArrowRight')step(1);
+ if(e.key===','){stepFrame(-1);e.preventDefault();}
+ if(e.key==='.'){stepFrame(1);e.preventDefault();}});
 /* Log panel visibility persists across the automatic page reloads that follow
    finished updates — otherwise the panel "keeps closing" mid-session. */
 function showLog(){document.getElementById('log').style.display='block';
@@ -3555,6 +3602,7 @@ function openHelp(){
   +row('⏬ backfill (on a card)','Deep pass that walks a profile\\u2019s FULL history and downloads anything missing \\u2014 the follow-up to a capped first clone. Resumable; run it again if Instagram pauses it.')
   +row('🗂 lists','Named groups/tags for organizing profiles; each list becomes a filter chip.')
   +row('📂 (on a card)','Opens that profile\\u2019s folder in Finder / your file manager.')
+  +row('⏮ ⏭ in a video','Step one frame back or forward (keys , and .). The player measures the clip\u2019s real frame rate; the ☀ slider lifts brightness and remembers your choice.')
   +row('⬇ save by link','Paste an instagram.com/p/\\u2026 or /reel/\\u2026 URL into the search box to save that single post into its owner\\u2019s folder \\u2014 catches posts hidden from the profile grid.')
   +row('▦ select','Multi-select mode \\u2014 pick several profiles to assign to a list or ⤳ merge into one timeline.')
   +row('💾 backup','Snapshot every offgram setting into a restorable .tar.gz. Your archive files are never included or touched.')
@@ -3590,6 +3638,14 @@ def page(title, body, extra_js=""):
             "<title>%s</title><style>%s</style></head><body>%s"
             "<div id='lb'><span class='close' onclick='closeLB()'>×</span>"
             "<span class='mute' id='mute' onclick='toggleMute()'></span>"
+            "<div id='vctl'>"
+            "<button onclick='stepFrame(-1)' title='Previous frame (,)'>\u23ee</button>"
+            "<button onclick='stepFrame(1)' title='Next frame (.)'>\u23ed</button>"
+            "<span class='vlab' id='vfps'></span>"
+            "<span class='vlab'>\u2600</span>"
+            "<input type='range' id='vbright' min='100' max='200' step='5' "
+            "oninput='setBright(this.value)' title='Brightness'>"
+            "<span class='vlab' id='vbrightval'></span></div>"
             "<span class='nav l' onclick='step(-1)'>‹</span>"
             "<span class='nav r' onclick='step(1)'>›</span>"
             "<div class='stage'></div><div class='cap' id='cap'></div></div>"
