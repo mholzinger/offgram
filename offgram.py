@@ -25,7 +25,7 @@ Design notes:
     thumbnails from them. A pure instaloader archive never uses any of this.
 """
 
-__version__ = "0.5.21"        # single source of truth — pyproject reads this
+__version__ = "0.5.22"        # single source of truth — pyproject reads this
 
 import configparser
 import errno
@@ -33,7 +33,10 @@ import hashlib
 import html
 import http.server
 import io
+import inspect
 import json
+import logging
+from logging.handlers import RotatingFileHandler
 import lzma
 import math
 import mimetypes
@@ -931,6 +934,54 @@ def remove_session(name):
     return True
 
 
+def _session_username(loader, verbose=False):
+    """Ask Instagram which account the session cookies belong to.
+
+    Since late Oct 2026 the legacy GraphQL login check that instaloader's
+    test_login() uses is answered with a redirect to the homepage (upstream
+    issue #2792), and the mobile API answers "fail" unless the request carries
+    the bearer token Instagram derives from the ds_user_id + sessionid cookies
+    (upstream PR #2771, in 4.16). This mirrors upstream PR #2795: build that
+    token and ask the mobile current_user endpoint. Works with the 4.15.x
+    engine and stays correct once the engine carries those fixes itself.
+    """
+    import json
+    import re
+    from base64 import b64encode
+
+    ctx = loader.context
+    cookies = ctx._session.cookies.get_dict()
+    sessionid, user_id = cookies.get("sessionid"), cookies.get("ds_user_id")
+    if not sessionid:
+        raise ValueError("no sessionid cookie: that browser is not logged into Instagram.")
+    if not user_id:
+        raise ValueError("no ds_user_id cookie: cannot build the mobile API token. "
+                         "Sign out and back in to Instagram in that browser, then retry.")
+    ctx.user_id = user_id            # attribute on 4.15.x, cookie-backed property on 4.16+
+    if not any(k.lower() == "authorization" for k in ctx.iphone_headers):
+        token = b64encode(json.dumps({"ds_user_id": user_id, "sessionid": sessionid},
+                                     separators=(",", ":")).encode()).decode()
+        ctx.iphone_headers["authorization"] = "Bearer IGT:2:" + token
+    if verbose:
+        print("offgram: login check: GET i.instagram.com/api/v1/accounts/current_user/ "
+              "with the derived bearer token (instaloader PRs #2771/#2795)", flush=True)
+    try:
+        data = ctx.get_iphone_json("api/v1/accounts/current_user/", {})
+    except Exception as exc:                          # noqa: BLE001
+        reason = str(exc).replace(sessionid, "[redacted]")
+        reason = re.sub(r"https?://\S+", "[URL omitted]", reason)
+        raise ValueError("mobile API login check failed: " + " ".join(reason.split())[:300]) from None
+    if not isinstance(data, dict):
+        raise ValueError("mobile API returned an unexpected JSON structure.")
+    user = data.get("user") or {}
+    username = user.get("username") if isinstance(user, dict) else None
+    if data.get("status") != "ok" or not isinstance(username, str) \
+            or not re.fullmatch(r"[A-Za-z0-9._]{1,30}", username):
+        raise ValueError("Instagram did not confirm the authenticated account; "
+                         "the saved session has not been replaced.")
+    return username
+
+
 def test_session(name):
     """Return the logged-in username if the saved session is still valid (a live
     authenticated call), or None if it's expired/stale. On-demand only."""
@@ -940,7 +991,7 @@ def test_session(name):
         import instaloader
         loader = instaloader.Instaloader(quiet=True)
         loader.load_session_from_file(name)
-        return loader.test_login()                    # username if valid, else None
+        return _session_username(loader)
     except Exception:                                 # noqa: BLE001
         return None
 
@@ -949,16 +1000,98 @@ def test_session(name):
 # session from a logged-in browser, sidestepping password + 2FA. Streamed like an
 # update so the user sees progress; the new session then appears in the switcher.
 COOKIE_JOB = {"running": False, "log": [], "browser": "", "before": []}
+COOKIE_LOG_FILE = CACHE_ROOT / "browser-import.log"
+COOKIE_LOG_LOCK = threading.Lock()
 
 
-def import_cookies_worker(browser, username):
-    COOKIE_JOB.update({"running": True, "log": [], "browser": browser,
+class _PrivateRotatingFileHandler(RotatingFileHandler):
+    def _open(self):
+        fd = os.open(self.baseFilename, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        return os.fdopen(fd, self.mode, encoding=self.encoding, errors=self.errors)
+
+
+class _CookieImportLog(list):
+    """Keep the UI log and a timestamped rotating file in sync."""
+
+    def __init__(self):
+        super().__init__()
+        self.logger = logging.getLogger("offgram.browser_import")
+        try:
+            with COOKIE_LOG_LOCK:
+                if not self.logger.handlers:
+                    COOKIE_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+                    fd = os.open(str(COOKIE_LOG_FILE), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+                    os.close(fd)
+                    os.chmod(COOKIE_LOG_FILE, 0o600)
+                    handler = _PrivateRotatingFileHandler(
+                        COOKIE_LOG_FILE, maxBytes=2_000_000, backupCount=3,
+                        encoding="utf-8")
+                    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+                    self.logger.addHandler(handler)
+                    self.logger.setLevel(logging.DEBUG)
+                    self.logger.propagate = False
+        except OSError as exc:
+            self.logger = None
+            super().append("offgram: cannot open verbose import log: %s" % exc)
+
+    def append(self, line):
+        super().append(line)
+        if self.logger is not None:
+            self.logger.info("%s", line)
+
+
+# Keep browser import separate from the CLI's --login flow, which loads an old
+# session *after* importing cookies and can then fall back to password / 2FA.
+COOKIE_IMPORT_SCRIPT = """
+import sys
+import re
+from importlib.metadata import version
+from pathlib import Path
+import instaloader
+from instaloader.__main__ import get_cookies_from_instagram
+""" + inspect.getsource(_session_username) + """
+
+loader = instaloader.Instaloader(quiet=True, max_connection_attempts=1, request_timeout=30)
+expected = sys.argv[2].strip().lstrip('@')
+unverified = sys.argv[4] == '1'
+if expected and not re.fullmatch(r'[A-Za-z0-9._]{1,30}', expected):
+    raise SystemExit('Enter a valid Instagram username.')
+if unverified and not expected:
+    raise SystemExit('A username is required to save cookies without API verification.')
+print('offgram: runtime: Python %s; instaloader %s; browser-cookie3 %s' % (sys.version.split()[0], instaloader.__version__, version('browser-cookie3')), flush=True)
+cookies = get_cookies_from_instagram('instagram', sys.argv[1], None)
+if not cookies or not cookies.get('sessionid'):
+    raise SystemExit('No Instagram login cookie found. Open Instagram in this browser and sign in, then retry.')
+loader.context.update_cookies(cookies)
+print('offgram: read %s Instagram cookie names; sessionid present; cookie values omitted' % len(cookies), flush=True)
+if unverified:
+    actual = expected
+    print('offgram: API verification skipped by request. The account name is user-supplied; cookie validity and account ownership are unverified.', flush=True)
+else:
+    try:
+        actual = _session_username(loader, verbose=True)
+    except Exception as exc:
+        print('offgram: browser cookies were read, but Instagram could not verify them. This does not establish that 2FA or a new session is needed. Existing saved sessions have not been changed.', flush=True)
+        raise SystemExit('Account verification failed: ' + str(exc))
+loader.context.username = actual
+if expected and actual.lower() != expected.lower():
+    raise SystemExit('Browser is logged in as @%s, not @%s. Switch accounts in the browser and retry.' % (actual, expected))
+session_dir = Path(sys.argv[3])
+session_dir.mkdir(parents=True, exist_ok=True)
+loader.save_session_to_file(str(session_dir / ('session-' + actual)))
+print('offgram: imported %sbrowser session for @%s' % ('UNVERIFIED ' if unverified else '', actual))
+"""
+
+
+def import_cookies_worker(browser, username, unverified=False):
+    COOKIE_JOB.update({"running": True, "log": _CookieImportLog(), "browser": browser,
                        "before": list_sessions()})
     log = COOKIE_JOB["log"]
-    cmd = [sys.executable, "-m", "instaloader", "--load-cookies", browser]
-    if username:
-        cmd += ["--login", username]
-    log.append("$ " + " ".join(cmd))
+    cmd = [sys.executable, "-u", "-c", COOKIE_IMPORT_SCRIPT,
+           browser, username, str(_session_dir()), '1' if unverified else '0']
+    log.append("offgram: importing fresh Instagram cookies from " + browser)
+    log.append("offgram: verbose log: " + str(COOKIE_LOG_FILE))
+    log.append("offgram: interpreter: " + sys.executable)
     try:
         proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -973,7 +1106,8 @@ def import_cookies_worker(browser, username):
         new = [s for s in list_sessions() if s not in COOKIE_JOB["before"]]
         if new:
             log.append("offgram: imported session(s): %s" % ", ".join(new))
-        elif any("browser_cookie3" in l for l in log):
+        elif any(("No module named" in l and "browser_cookie3" in l)
+                 or "browser_cookie3 library is needed" in l for l in log):
             if "pipx" in sys.executable:
                 log.append("offgram: the cookie reader is missing — with a pipx "
                            "install it must go INTO offgram's venv:  "
@@ -986,9 +1120,9 @@ def import_cookies_worker(browser, username):
                            "browser_cookie3  (then retry)."
                            % sys.executable)
         elif proc.returncode == 0:
-            log.append("offgram: no new session appeared — make sure you're logged "
-                       "into Instagram in that browser. Firefox/Chrome are most "
-                       "reliable; Safari cookie access is unreliable on macOS.")
+            log.append("offgram: refreshed the existing saved session.")
+        if proc.returncode == 0:
+            _il["ctx"], _il["tried"] = None, False
         log.append("--- finished (exit %s) ---" % proc.returncode)
     except Exception as exc:                          # noqa: BLE001
         log.append("error: %s" % exc)
@@ -996,10 +1130,10 @@ def import_cookies_worker(browser, username):
         COOKIE_JOB["running"] = False
 
 
-def start_cookie_import(browser, username):
+def start_cookie_import(browser, username, unverified=False):
     if COOKIE_JOB["running"]:
         return False
-    threading.Thread(target=import_cookies_worker, args=(browser, username),
+    threading.Thread(target=import_cookies_worker, args=(browser, username, unverified),
                      daemon=True).start()
     return True
 
@@ -3575,8 +3709,10 @@ function openAccounts(){fetch('/sessions').then(r=>r.json()).then(d=>{
   +'<div class="newrow"><select id="impbrowser">'+opts+'</select>'
   +'<input id="impuser" placeholder="username (optional)">'
   +'<button class="btn go" onclick="importCookies()">⇪ import</button></div>'
+  +'<label class="sub"><input type="checkbox" id="impunverified"> Save without API verification (username required; replaces its saved session). Use the account logged into this browser. Downloads may still fail.</label>'
   +'<div id="implog" class="sub" style="white-space:pre-wrap;margin-top:8px"></div>'
   +'<div class="mbtns"><button class="btn" onclick="closeModal()">close</button></div>');
+ var el=document.getElementById('implog');if(el)el.textContent=(d.importlog||[]).join('\\n');
  if(d.importing)pollCookieImport();});}
 function testSession(n){var el=document.getElementById('st-'+n);if(el)el.textContent='…testing';
  fetch('/account',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
@@ -3589,8 +3725,10 @@ function removeSession(n){if(!confirm('Sign out and delete the saved session for
   body:'action=remove&login='+encodeURIComponent(n)}).then(function(){openAccounts();});}
 function importCookies(){var b=document.getElementById('impbrowser').value;
  var u=(document.getElementById('impuser').value||'').trim();
+ var unverified=document.getElementById('impunverified').checked;
+ if(unverified&&!u){alert('Enter the username logged into Instagram in this browser.');return;}
  fetch('/account',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
-  body:'action=import&browser='+encodeURIComponent(b)+'&login='+encodeURIComponent(u)})
+  body:'action=import&browser='+encodeURIComponent(b)+'&login='+encodeURIComponent(u)+'&unverified='+(unverified?'1':'0')})
   .then(function(r){return r.json();}).then(function(d){
    if(!d.ok){alert('Import: '+(d.note||'failed'));return;}pollCookieImport();});}
 function pollCookieImport(){fetch('/sessions').then(function(r){return r.json();}).then(function(d){
@@ -4555,7 +4693,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "application/json")
             elif action == "import":
                 ok = start_cookie_import(
-                    form.get("browser", ["firefox"])[0].strip().lower(), login.strip())
+                    form.get("browser", ["firefox"])[0].strip().lower(), login.strip(),
+                    form.get("unverified", ["0"])[0] == "1")
                 return self._send(200 if ok else 409,
                                   b'{"ok":true}' if ok else
                                   b'{"ok":false,"note":"import already running"}',

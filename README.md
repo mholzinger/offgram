@@ -120,6 +120,10 @@ If you already have a saved session, offgram uses it automatically — `INSTALOA
 
 Add more accounts the same way — they appear in the in-app account switcher. Or skip the CLI entirely: in the running app, **⚙ accounts → import** pulls a session straight from a logged-in browser (`--load-cookies`), no password or 2FA required. The cookie reader (`browser-cookie3`) ships with offgram as of v0.5.16; on an older install add it with `pipx inject offgram browser_cookie3` (NOT `pipx install`, which makes a separate venv offgram can't see). **Firefox or Chrome are the most reliable** — Safari cookie access is flaky on macOS.
 
+Browser imports also write a timestamped verbose log to `browser-import.log` in the archive's cache directory (`OFFGRAM_CACHE`, or the per-archive directory under `~/.cache/offgram`). The Accounts import output shows the full path. It records runtime versions, import progress, HTTP status/content type, sanitized API rejection messages, and the final result; cookie values and full response bodies are omitted. Logs persist across restarts and rotate at 2 MB, keeping three older files. For live output, run `tail -f /path/shown/in/accounts/browser-import.log` after restarting Offgram and starting an import.
+
+The import checks the cookies with Instagram's mobile account endpoint using the same bearer token Instagram derives from the session cookies (instaloader PRs #2771/#2795); the legacy GraphQL login check broke in late Oct 2026 (upstream issue #2792). If that check still fails despite a working browser login, Accounts offers **Save without API verification**. Enter the username currently logged into the selected browser. This saves the extracted cookies under that name and replaces its existing saved session, without confirming cookie validity or account ownership. The import log labels this result **UNVERIFIED**; downloads may still fail. Leave the option unchecked for normal verified imports.
+
 ### Environment variables (override config)
 
 | Variable | Default | Purpose |

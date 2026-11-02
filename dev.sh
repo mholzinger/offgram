@@ -35,6 +35,11 @@ if ! "$VENV/bin/python" -c "import instaloader" 2>/dev/null; then
     fi
 fi
 
+if ! "$VENV/bin/python" -c "import browser_cookie3" 2>/dev/null; then
+    echo "▸ installing browser cookie reader for account imports…"
+    "$VENV/bin/pip" install --quiet browser-cookie3
+fi
+
 if [ -d "$FORK/.git" ]; then
     echo "▸ engine: local fork on branch '$(git -C "$FORK" branch --show-current)'"
 fi
