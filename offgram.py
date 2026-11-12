@@ -25,7 +25,7 @@ Design notes:
     thumbnails from them. A pure instaloader archive never uses any of this.
 """
 
-__version__ = "0.5.22"        # single source of truth — pyproject reads this
+__version__ = "0.5.23"        # single source of truth (pyproject reads this)
 
 import configparser
 import errno
@@ -2499,6 +2499,7 @@ UPDATE_LOCK = threading.Lock()
 
 
 def run_update(profiles, deep=False):
+    account_refused = False
     for profile in profiles:
         with JOBS_LOCK:
             # queued=True until this profile actually starts downloading, so
@@ -2518,11 +2519,26 @@ def run_update(profiles, deep=False):
             j = JOBS.get(profile)
             if j:
                 j["queued"] = False
+        if account_refused:
+            # an earlier profile in this batch was refused at the account
+            # level; do not send the rest of the queue into the same wall
+            with JOBS_LOCK:
+                j = JOBS.get(profile)
+                if j:
+                    j["log"].append(
+                        "offgram: skipped, Instagram refused the lookup on an "
+                        "earlier profile in this batch. Nothing was requested.")
+                    j["running"] = False
+                    j["rc"] = IL_DOWNLOAD_ABORTED
+            UPDATE_LOCK.release()
+            continue
         try:
             if not deep:              # backfill never touches the stamps
                 seed_stamps(profile)
             seed_profile_id(profile)  # id-based resolution survives throttles
             _run_one(profile, deep=deep)
+            if (JOBS.get(profile) or {}).get("rc") == IL_DOWNLOAD_ABORTED:
+                account_refused = True
             # refresh just this profile in the index after download
             try:
                 rec = scan_profile(profile)
@@ -2805,6 +2821,9 @@ def _is_first_clone(folder):
         return False      # unreachable disk: don't guess; the run fails loudly anyway
 
 
+IL_DOWNLOAD_ABORTED = 4      # instaloader ExitCode.DOWNLOAD_ABORTED
+
+
 def _run_one(folder, deep=False):
     log = JOBS[folder]["log"]
     if not current_login():
@@ -2834,6 +2853,20 @@ def _run_one(folder, deep=False):
                    "disables this cap." % FIRST_CLONE_COUNT)
     rc = _il_run(folder, target, folder, [],
                  list(INSTALOADER_EXTRA) + cap, deep=deep)        # posts -> folder/
+    if rc == IL_DOWNLOAD_ABORTED:
+        # Instagram refused the account itself (feedback_required, checkpoint,
+        # logged out). Every further pass would be refused the same way and
+        # each extra request can lengthen a restriction, so stop here.
+        log.append("offgram: Instagram refused the request itself, not this "
+                   "profile (see the 'Download aborted' line above). Skipping "
+                   "the remaining passes. If a second account in \u2699 accounts "
+                   "fails the same way, the engine needs an update; retrying "
+                   "will not help.")
+        with JOBS_LOCK:
+            JOBS[folder]["running"] = False
+            JOBS[folder]["rc"] = rc
+        log.append("--- finished (exit %s) ---" % rc)
+        return
     if deep:
         time.sleep(PASS_DELAY)
         log.append("--- backfill: reels ---")
